@@ -52,6 +52,16 @@ Build the container image:
 docker build -t onym-relayer .
 ```
 
+Deploy to DigitalOcean App Platform:
+
+```sh
+scripts/deploy-digitalocean.sh "$DIGITALOCEAN_TOKEN" --env-file .env
+```
+
+The deploy script is idempotent by app name and registry name: it reuses or
+creates the DigitalOcean Container Registry, pushes `onym-relayer:current`, then
+creates or updates the App Platform app.
+
 ## API
 
 The service accepts `POST /` requests with:
