@@ -80,7 +80,38 @@ The service accepts `POST /` requests with:
 `contractID` must be one of the configured per-type IDs. `contractType` may be
 `anarchy`, `oneonone`, `democracy`, `oligarchy`, or `tyranny`.
 
-Allowed public functions are the fresh per-type contract entrypoints:
+Allowed public functions are the current per-type Soroban entrypoints:
 `create_group`, `create_oligarchy_group`, `update_commitment`,
-`verify_membership`, `get_commitment`, and `get_history` where supported by the
-target contract.
+`verify_membership`, `get_commitment`, `get_history`, `bump_group_ttl`, and
+tyranny-only `get_admin_commitment` where supported by the target contract.
+`set_restricted_mode` is exposed only when `RELAYER_AUTH_TOKENS` is configured,
+because the relayer signs that admin operation.
+
+Byte fields may be sent as base64 or hex. The relayer forwards Soroban
+`BytesN` arguments to `stellar contract invoke` as hex.
+
+Proof-carrying calls use the PLONK contract surface:
+
+- `proof`: 1601-byte PLONK proof, base64 or hex.
+- `publicInputs`: `Vec<BytesN<32>>`, preferably a JSON array of 32-byte hex or
+  base64 strings. Object form is also accepted for compatibility and is
+  normalized into the contract's ordered vector.
+
+Example:
+
+```json
+{
+  "contractID": "C...",
+  "contractType": "anarchy",
+  "function": "update_commitment",
+  "payload": {
+    "group_id": "base64-or-hex-32-byte-group-id",
+    "proof": "base64-or-hex-1601-byte-proof",
+    "publicInputs": [
+      "hex-or-base64-c-old",
+      "hex-or-base64-epoch-old-be32",
+      "hex-or-base64-c-new"
+    ]
+  }
+}
+```

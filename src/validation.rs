@@ -6,7 +6,15 @@ use std::time::Instant;
 use crate::config::{Config, ContractType};
 
 /// Functions that are read-only (use `--send no`).
-pub const READ_ONLY_FUNCTIONS: &[&str] = &["verify_membership", "get_commitment", "get_history"];
+pub const READ_ONLY_FUNCTIONS: &[&str] = &[
+    "verify_membership",
+    "get_commitment",
+    "get_admin_commitment",
+    "get_history",
+];
+
+/// State-changing admin functions that must not be exposed by an unauthenticated relayer.
+const RELAYER_AUTH_REQUIRED_FUNCTIONS: &[&str] = &["set_restricted_mode"];
 
 /// Functions that include a proof field in the payload.
 const PROOF_FUNCTIONS: &[&str] = &[
@@ -16,8 +24,8 @@ const PROOF_FUNCTIONS: &[&str] = &[
     "verify_membership",
 ];
 
-/// Expected decoded proof size (96 + 192 + 96 = 384 bytes).
-const EXPECTED_PROOF_SIZE: usize = 384;
+/// Expected decoded PLONK proof size.
+const EXPECTED_PROOF_SIZE: usize = 1601;
 
 /// Validate a request against the relayer's security rules.
 pub fn validate_request(
@@ -48,13 +56,17 @@ pub fn validate_request(
             "function not allowed for {contract_type}: {function}"
         ));
     }
+    if RELAYER_AUTH_REQUIRED_FUNCTIONS.contains(&function) && !config.auth_required() {
+        return Err(format!(
+            "{function} requires RELAYER_AUTH_TOKENS because it signs an admin operation"
+        ));
+    }
 
     // 3. Proof size validation (for functions that include a proof)
     if PROOF_FUNCTIONS.contains(&function) {
-        if let Some(proof_b64) = payload.get("proof").and_then(|v| v.as_str()) {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(proof_b64)
-                .map_err(|e| format!("invalid proof base64: {e}"))?;
+        if let Some(proof) = payload.get("proof").and_then(|v| v.as_str()) {
+            let decoded =
+                decode_hex_or_base64(proof).map_err(|e| format!("invalid proof encoding: {e}"))?;
             if decoded.len() != EXPECTED_PROOF_SIZE {
                 return Err(format!(
                     "proof must be {EXPECTED_PROOF_SIZE} bytes, got {}",
@@ -69,18 +81,35 @@ pub fn validate_request(
 
 fn function_allowed(contract_type: ContractType, function: &str) -> bool {
     match contract_type {
-        ContractType::Anarchy | ContractType::Democracy | ContractType::Tyranny => matches!(
+        ContractType::Anarchy | ContractType::Democracy => matches!(
             function,
             "create_group"
                 | "update_commitment"
                 | "verify_membership"
                 | "get_commitment"
+                | "bump_group_ttl"
+                | "set_restricted_mode"
+                | "get_history"
+        ),
+        ContractType::Tyranny => matches!(
+            function,
+            "create_group"
+                | "update_commitment"
+                | "verify_membership"
+                | "get_commitment"
+                | "get_admin_commitment"
+                | "bump_group_ttl"
+                | "set_restricted_mode"
                 | "get_history"
         ),
         ContractType::OneOnOne => {
             matches!(
                 function,
-                "create_group" | "verify_membership" | "get_commitment"
+                "create_group"
+                    | "verify_membership"
+                    | "get_commitment"
+                    | "bump_group_ttl"
+                    | "set_restricted_mode"
             )
         }
         ContractType::Oligarchy => matches!(
@@ -89,9 +118,25 @@ fn function_allowed(contract_type: ContractType, function: &str) -> bool {
                 | "update_commitment"
                 | "verify_membership"
                 | "get_commitment"
+                | "bump_group_ttl"
+                | "set_restricted_mode"
                 | "get_history"
         ),
     }
+}
+
+fn decode_hex_or_base64(raw: &str) -> Result<Vec<u8>, String> {
+    let trimmed = raw.trim();
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if hex.len() == EXPECTED_PROOF_SIZE * 2 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return hex::decode(hex).map_err(|e| format!("invalid proof hex: {e}"));
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .map_err(|e| format!("invalid proof base64: {e}"))
 }
 
 /// Validate bearer token if auth is required.
@@ -278,6 +323,7 @@ mod tests {
             "verify_membership",
             "get_commitment",
             "get_history",
+            "bump_group_ttl",
         ] {
             assert!(
                 validate_request(&config, ContractType::Anarchy, "C1", func, &payload).is_ok(),
@@ -326,9 +372,62 @@ mod tests {
     }
 
     #[test]
-    fn test_proof_size_384_bytes_accepted() {
+    fn test_set_restricted_mode_requires_relayer_auth_tokens() {
         let config = config_no_auth("C1");
-        let proof = make_proof_base64(384);
+        let payload = serde_json::json!({ "restricted": true });
+        let result = validate_request(
+            &config,
+            ContractType::Anarchy,
+            "C1",
+            "set_restricted_mode",
+            &payload,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("RELAYER_AUTH_TOKENS"));
+    }
+
+    #[test]
+    fn test_set_restricted_mode_allowed_when_relayer_auth_configured() {
+        let config = config_with_auth("C1", "validtoken");
+        let payload = serde_json::json!({ "restricted": true });
+        assert!(validate_request(
+            &config,
+            ContractType::Anarchy,
+            "C1",
+            "set_restricted_mode",
+            &payload
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_get_admin_commitment_only_allowed_for_tyranny() {
+        let anarchy = config_no_auth("C1");
+        let payload = serde_json::json!({});
+        assert!(validate_request(
+            &anarchy,
+            ContractType::Anarchy,
+            "C1",
+            "get_admin_commitment",
+            &payload
+        )
+        .is_err());
+
+        let tyranny = make_config(ContractType::Tyranny, "C2", HashSet::new());
+        assert!(validate_request(
+            &tyranny,
+            ContractType::Tyranny,
+            "C2",
+            "get_admin_commitment",
+            &payload
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_proof_size_1601_bytes_accepted() {
+        let config = config_no_auth("C1");
+        let proof = make_proof_base64(1601);
         let payload = serde_json::json!({ "proof": proof });
         assert!(validate_request(
             &config,
@@ -353,7 +452,7 @@ mod tests {
             &payload,
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("384 bytes"));
+        assert!(result.unwrap_err().contains("1601 bytes"));
     }
 
     #[test]

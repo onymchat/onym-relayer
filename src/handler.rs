@@ -266,13 +266,28 @@ fn contract_function_for(
                 Ok("get_history")
             }
         }
+        "get_admin_commitment" => {
+            if contract_type == ContractType::Tyranny {
+                Ok("get_admin_commitment")
+            } else {
+                Err(format!(
+                    "get_admin_commitment is only valid for the tyranny contract, got {contract_type}"
+                ))
+            }
+        }
+        "bump_group_ttl" => Ok("bump_group_ttl"),
+        "set_restricted_mode" => Ok("set_restricted_mode"),
         other => Err(format!("function not allowed for {contract_type}: {other}")),
     }
 }
 
 fn success_response(invocation: &ResolvedInvocation, output: String) -> Result<Response, String> {
     match invocation.contract_function.as_str() {
-        "create_group" | "update_commitment" | "create_oligarchy_group" => Ok((
+        "create_group"
+        | "update_commitment"
+        | "create_oligarchy_group"
+        | "bump_group_ttl"
+        | "set_restricted_mode" => Ok((
             StatusCode::OK,
             Json(RelayerResponse {
                 accepted: true,
@@ -295,6 +310,14 @@ fn success_response(invocation: &ResolvedInvocation, output: String) -> Result<R
             })?;
             normalize_bytes_fields(&mut value)?;
             Ok((StatusCode::OK, Json(value)).into_response())
+        }
+        "get_admin_commitment" => {
+            let commitment = parse_bytes_output(&output)?;
+            Ok((
+                StatusCode::OK,
+                Json(json!({ "adminPubkeyCommitment": commitment })),
+            )
+                .into_response())
         }
         other => Err(format!("unsupported function: {other}")),
     }
@@ -336,6 +359,16 @@ fn normalize_bytes_fields(value: &mut Value) -> Result<(), String> {
     }
 }
 
+fn parse_bytes_output(output: &str) -> Result<String, String> {
+    let trimmed = output.trim();
+    let value = serde_json::from_str::<Value>(trimmed)
+        .unwrap_or_else(|_| Value::String(trimmed.trim_matches('"').to_string()));
+    let Some(s) = value.as_str() else {
+        return Err(format!("expected bytes output string, got: {output}"));
+    };
+    hex_to_base64_if_needed(s)
+}
+
 fn is_bytes_field(key: &str) -> bool {
     matches!(
         key,
@@ -354,8 +387,12 @@ fn is_bytes_field(key: &str) -> bool {
 }
 
 fn hex_to_base64_if_needed(s: &str) -> Result<String, String> {
-    if s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let bytes = hex::decode(s).map_err(|e| format!("invalid hex commitment: {e}"))?;
+    let hex = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    if hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let bytes = hex::decode(hex).map_err(|e| format!("invalid hex commitment: {e}"))?;
         Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
     } else {
         Ok(s.to_string())
@@ -415,14 +452,17 @@ async fn invoke_contract(
             // derives new_epoch on-chain as stored_epoch + 1.
             add_hex_arg(&mut cmd, "--group-id", payload, GROUP_ID_KEYS)?;
             add_proof_arg(&mut cmd, payload)?;
-            add_update_public_inputs_arg(invocation.contract_type, &mut cmd, payload)?;
+            add_public_inputs_arg(invocation.contract_type, function, &mut cmd, payload)?;
         }
         (_, "verify_membership") => {
             add_hex_arg(&mut cmd, "--group-id", payload, GROUP_ID_KEYS)?;
             add_proof_arg(&mut cmd, payload)?;
-            add_membership_public_inputs_arg(&mut cmd, payload)?;
+            add_public_inputs_arg(invocation.contract_type, function, &mut cmd, payload)?;
         }
         (_, "get_commitment") => {
+            add_hex_arg(&mut cmd, "--group-id", payload, GROUP_ID_KEYS)?;
+        }
+        (_, "get_admin_commitment") => {
             add_hex_arg(&mut cmd, "--group-id", payload, GROUP_ID_KEYS)?;
         }
         (_, "get_history") => {
@@ -431,6 +471,12 @@ async fn invoke_contract(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(64);
             cmd.arg("--max-entries").arg(max_entries.to_string());
+        }
+        (_, "bump_group_ttl") => {
+            add_hex_arg(&mut cmd, "--group-id", payload, GROUP_ID_KEYS)?;
+        }
+        (_, "set_restricted_mode") => {
+            add_bool_arg(&mut cmd, "--restricted", payload, RESTRICTED_KEYS)?;
         }
         _ => return Err(format!("unsupported function: {function}")),
     }
@@ -460,6 +506,8 @@ async fn invoke_contract(
 /// variants with different values, the snake_case value always wins.
 pub(crate) const GROUP_ID_KEYS: &[&str] = &["group_id", "groupID"];
 pub(crate) const GROUP_TYPE_KEYS: &[&str] = &["group_type", "groupType"];
+pub(crate) const COMMITMENT_KEYS: &[&str] = &["commitment"];
+pub(crate) const EPOCH_KEYS: &[&str] = &["epoch"];
 pub(crate) const MEMBER_COUNT_KEYS: &[&str] = &["member_count", "memberCount"];
 pub(crate) const TIER_KEYS: &[&str] = &["tier"];
 pub(crate) const MEMBER_TIER_KEYS: &[&str] = &["member_tier", "memberTier", "tier"];
@@ -496,8 +544,10 @@ pub(crate) const SALT_INITIAL_KEYS: &[&str] = &["salt_initial", "saltInitial"];
 pub(crate) const C_OLD_KEYS: &[&str] = &["c_old", "cOld"];
 pub(crate) const EPOCH_OLD_KEYS: &[&str] = &["epoch_old", "epochOld"];
 pub(crate) const C_NEW_KEYS: &[&str] = &["c_new", "cNew"];
+pub(crate) const GROUP_ID_FR_KEYS: &[&str] = &["group_id_fr", "groupIdFr"];
 pub(crate) const PUBLIC_INPUTS_KEYS: &[&str] = &["public_inputs", "publicInputs"];
 pub(crate) const MAX_ENTRIES_KEYS: &[&str] = &["max_entries", "maxEntries"];
+pub(crate) const RESTRICTED_KEYS: &[&str] = &["restricted"];
 
 /// Look up a value under the first matching key (supports camelCase/snake_case
 /// payload variants emitted by different client SDKs).
@@ -513,12 +563,10 @@ fn add_hex_arg(
     payload: &Value,
     keys: &[&str],
 ) -> Result<(), String> {
-    let b64 = field_value(payload, keys)
+    let raw = field_value(payload, keys)
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("missing field: {}", keys.join("/")))?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|e| format!("invalid base64 for {}: {e}", keys.join("/")))?;
+    let bytes = decode_wire_bytes(raw, &keys.join("/"), Some(32))?;
     cmd.arg(flag).arg(hex_encode(&bytes));
     Ok(())
 }
@@ -554,6 +602,19 @@ fn add_int_arg_or_default(
     Ok(())
 }
 
+fn add_bool_arg(
+    cmd: &mut Command,
+    flag: &str,
+    payload: &Value,
+    keys: &[&str],
+) -> Result<(), String> {
+    let val = field_value(payload, keys)
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| format!("missing or invalid field: {}", keys.join("/")))?;
+    cmd.arg(flag).arg(if val { "true" } else { "false" });
+    Ok(())
+}
+
 fn add_create_group_args(
     contract_type: ContractType,
     config: &Config,
@@ -567,13 +628,13 @@ fn add_create_group_args(
     match contract_type {
         ContractType::OneOnOne => {
             add_proof_arg(cmd, payload)?;
-            add_membership_public_inputs_arg(cmd, payload)?;
+            add_public_inputs_arg(contract_type, "create_group", cmd, payload)?;
         }
         ContractType::Anarchy => {
             add_int_arg(cmd, "--tier", payload, TIER_KEYS)?;
             add_int_arg_or_default(cmd, "--member-count", payload, MEMBER_COUNT_KEYS, 0)?;
             add_proof_arg(cmd, payload)?;
-            add_membership_public_inputs_arg(cmd, payload)?;
+            add_public_inputs_arg(contract_type, "create_group", cmd, payload)?;
         }
         ContractType::Democracy => {
             add_int_arg(cmd, "--tier", payload, TIER_KEYS)?;
@@ -590,7 +651,7 @@ fn add_create_group_args(
                 OCCUPANCY_COMMITMENT_INITIAL_KEYS,
             )?;
             add_proof_arg(cmd, payload)?;
-            add_membership_public_inputs_arg(cmd, payload)?;
+            add_public_inputs_arg(contract_type, "create_group", cmd, payload)?;
         }
         ContractType::Tyranny => {
             add_int_arg(cmd, "--tier", payload, TIER_KEYS)?;
@@ -601,7 +662,7 @@ fn add_create_group_args(
                 ADMIN_PUBKEY_COMMITMENT_KEYS,
             )?;
             add_proof_arg(cmd, payload)?;
-            add_tyranny_create_public_inputs_arg(cmd, payload)?;
+            add_public_inputs_arg(contract_type, "create_group", cmd, payload)?;
         }
         ContractType::Oligarchy => {
             return Err("oligarchy uses create_oligarchy_group".to_string());
@@ -632,180 +693,327 @@ fn add_create_oligarchy_group_args(
         payload,
         OCCUPANCY_COMMITMENT_INITIAL_KEYS,
     )?;
-    add_hex_arg(cmd, "--member-root", payload, MEMBER_ROOT_KEYS)?;
-    add_hex_arg(cmd, "--admin-root", payload, ADMIN_ROOT_KEYS)?;
-    add_hex_arg(cmd, "--salt-initial", payload, SALT_INITIAL_KEYS)?;
     add_proof_arg(cmd, payload)?;
-    add_oligarchy_create_public_inputs_arg(cmd, payload)?;
+    add_public_inputs_arg(
+        ContractType::Oligarchy,
+        "create_oligarchy_group",
+        cmd,
+        payload,
+    )?;
     Ok(())
 }
 
-/// Decode the proof from base64 and add as a JSON file-path argument.
-/// The proof is 384 bytes: a(96) || b(192) || c(96).
+/// Decode the PLONK proof and add it as the `BytesN<1601>` hex argument
+/// expected by the Stellar implicit CLI.
 fn add_proof_arg(cmd: &mut Command, payload: &Value) -> Result<(), String> {
-    let proof_b64 = payload
+    let proof = payload
         .get("proof")
         .and_then(|v| v.as_str())
         .ok_or("missing proof field")?;
-    let proof_bytes = base64::engine::general_purpose::STANDARD
-        .decode(proof_b64)
-        .map_err(|e| format!("invalid proof base64: {e}"))?;
-    if proof_bytes.len() != 384 {
+    let proof_bytes = decode_wire_bytes(proof, "proof", Some(1601))?;
+    cmd.arg("--proof").arg(hex_encode(&proof_bytes));
+    Ok(())
+}
+
+fn add_public_inputs_arg(
+    contract_type: ContractType,
+    function: &str,
+    cmd: &mut Command,
+    payload: &Value,
+) -> Result<(), String> {
+    let public_inputs = public_inputs_bytes(contract_type, function, payload)?;
+    let expected = expected_public_input_count(contract_type, function)?;
+    if public_inputs.len() != expected {
         return Err(format!(
-            "proof must be 384 bytes, got {}",
-            proof_bytes.len()
+            "{function} for {contract_type} expects {expected} public inputs, got {}",
+            public_inputs.len()
         ));
     }
-    let a = &proof_bytes[0..96];
-    let b = &proof_bytes[96..288];
-    let c = &proof_bytes[288..384];
 
-    let proof_json = json!({
-        "a": hex_encode(a),
-        "b": hex_encode(b),
-        "c": hex_encode(c),
-    })
-    .to_string();
-
-    // Write to a temp file since stellar CLI expects --proof-file-path
-    let tmp = write_temp_json("proof", &proof_json)?;
-    cmd.arg("--proof-file-path").arg(tmp);
+    let hex_values: Vec<String> = public_inputs
+        .iter()
+        .map(|bytes| hex_encode(bytes))
+        .collect();
+    let pi_json = serde_json::to_string(&hex_values)
+        .map_err(|e| format!("failed to encode public inputs JSON: {e}"))?;
+    cmd.arg("--public-inputs").arg(pi_json);
     Ok(())
 }
 
-/// Decode membership-circuit public inputs and add as a JSON file-path argument.
-/// Used by create_group and verify_membership.
-/// Expects `payload.publicInputs = { commitment: base64, epoch: u64 }`.
-fn add_membership_public_inputs_arg(cmd: &mut Command, payload: &Value) -> Result<(), String> {
-    let pi = field_value(payload, PUBLIC_INPUTS_KEYS).ok_or("missing publicInputs field")?;
-    let commitment = decode_b64_field(pi, &["commitment"])?;
-    let epoch = number_field(pi, &["epoch"])?;
-
-    let pi_json = json!({
-        "commitment": hex_encode(&commitment),
-        "epoch": epoch,
-    })
-    .to_string();
-
-    let tmp = write_temp_json("public-inputs", &pi_json)?;
-    cmd.arg("--public-inputs-file-path").arg(tmp);
-    Ok(())
-}
-
-fn add_tyranny_create_public_inputs_arg(cmd: &mut Command, payload: &Value) -> Result<(), String> {
-    let pi = field_value(payload, PUBLIC_INPUTS_KEYS).ok_or("missing publicInputs field")?;
-    let commitment = decode_b64_field(pi, &["commitment"])?;
-    let epoch = number_field(pi, &["epoch"])?;
-    let admin_pubkey_commitment = decode_b64_field(pi, ADMIN_PUBKEY_COMMITMENT_KEYS)
-        .or_else(|_| decode_b64_field(payload, ADMIN_PUBKEY_COMMITMENT_KEYS))?;
-
-    let pi_json = json!({
-        "commitment": hex_encode(&commitment),
-        "epoch": epoch,
-        "admin_pubkey_commitment": hex_encode(&admin_pubkey_commitment),
-    })
-    .to_string();
-
-    let tmp = write_temp_json("tyranny-create-public-inputs", &pi_json)?;
-    cmd.arg("--public-inputs-file-path").arg(tmp);
-    Ok(())
-}
-
-fn add_oligarchy_create_public_inputs_arg(
-    cmd: &mut Command,
-    payload: &Value,
-) -> Result<(), String> {
-    let pi = field_value(payload, PUBLIC_INPUTS_KEYS).ok_or("missing publicInputs field")?;
-    let commitment = decode_b64_field(pi, &["commitment"])?;
-    let epoch = number_field(pi, &["epoch"])?;
-    let occupancy_commitment = decode_b64_field(pi, OCCUPANCY_COMMITMENT_INITIAL_KEYS)
-        .or_else(|_| decode_b64_field(payload, OCCUPANCY_COMMITMENT_INITIAL_KEYS))?;
-    let member_root = decode_b64_field(pi, MEMBER_ROOT_KEYS)
-        .or_else(|_| decode_b64_field(payload, MEMBER_ROOT_KEYS))?;
-    let admin_root = decode_b64_field(pi, ADMIN_ROOT_KEYS)
-        .or_else(|_| decode_b64_field(payload, ADMIN_ROOT_KEYS))?;
-    let salt_initial = decode_b64_field(pi, SALT_INITIAL_KEYS)
-        .or_else(|_| decode_b64_field(payload, SALT_INITIAL_KEYS))?;
-
-    let pi_json = json!({
-        "commitment": hex_encode(&commitment),
-        "epoch": epoch,
-        "occupancy_commitment": hex_encode(&occupancy_commitment),
-        "member_root": hex_encode(&member_root),
-        "admin_root": hex_encode(&admin_root),
-        "salt_initial": hex_encode(&salt_initial),
-    })
-    .to_string();
-
-    let tmp = write_temp_json("oligarchy-create-public-inputs", &pi_json)?;
-    cmd.arg("--public-inputs-file-path").arg(tmp);
-    Ok(())
-}
-
-/// Decode update-circuit public inputs and add as a JSON file-path argument.
-fn add_update_public_inputs_arg(
+fn public_inputs_bytes(
     contract_type: ContractType,
-    cmd: &mut Command,
+    function: &str,
     payload: &Value,
-) -> Result<(), String> {
+) -> Result<Vec<Vec<u8>>, String> {
     let pi = field_value(payload, PUBLIC_INPUTS_KEYS).ok_or("missing publicInputs field")?;
-    let c_old = decode_b64_field(pi, C_OLD_KEYS)?;
-    let epoch_old = number_field(pi, EPOCH_OLD_KEYS)?;
-    let c_new = decode_b64_field(pi, C_NEW_KEYS)?;
+    public_inputs_from_value(contract_type, function, pi, payload)
+}
 
-    let mut public_inputs = json!({
-        "c_old": hex_encode(&c_old),
-        "epoch_old": epoch_old,
-        "c_new": hex_encode(&c_new),
-    });
+fn public_inputs_from_value(
+    contract_type: ContractType,
+    function: &str,
+    value: &Value,
+    payload: &Value,
+) -> Result<Vec<Vec<u8>>, String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let raw = item
+                    .as_str()
+                    .ok_or_else(|| format!("publicInputs[{i}] must be a hex or base64 string"))?;
+                decode_wire_bytes(raw, &format!("publicInputs[{i}]"), Some(32))
+            })
+            .collect(),
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.starts_with('[') {
+                let parsed: Value = serde_json::from_str(trimmed)
+                    .map_err(|e| format!("invalid publicInputs JSON array string: {e}"))?;
+                return public_inputs_from_value(contract_type, function, &parsed, payload);
+            }
+            let bytes = decode_wire_bytes(trimmed, "publicInputs", None)?;
+            if bytes.len() % 32 != 0 {
+                return Err(format!(
+                    "publicInputs byte string length must be a multiple of 32, got {}",
+                    bytes.len()
+                ));
+            }
+            Ok(bytes.chunks(32).map(|chunk| chunk.to_vec()).collect())
+        }
+        Value::Object(_) => {
+            build_public_inputs_from_object(contract_type, function, value, payload)
+        }
+        _ => Err("publicInputs must be an array, object, or encoded byte string".to_string()),
+    }
+}
 
-    if matches!(
-        contract_type,
-        ContractType::Democracy | ContractType::Oligarchy
-    ) {
-        let occupancy_commitment_old = decode_b64_field(pi, OCCUPANCY_COMMITMENT_OLD_KEYS)?;
-        let occupancy_commitment_new = decode_b64_field(pi, OCCUPANCY_COMMITMENT_NEW_KEYS)?;
-        public_inputs["occupancy_commitment_old"] =
-            Value::String(hex_encode(&occupancy_commitment_old));
-        public_inputs["occupancy_commitment_new"] =
-            Value::String(hex_encode(&occupancy_commitment_new));
+fn build_public_inputs_from_object(
+    contract_type: ContractType,
+    function: &str,
+    pi: &Value,
+    payload: &Value,
+) -> Result<Vec<Vec<u8>>, String> {
+    match function {
+        "verify_membership" => membership_public_inputs(pi, payload),
+        "create_group" => match contract_type {
+            ContractType::OneOnOne | ContractType::Anarchy => {
+                create_membership_public_inputs(pi, payload)
+            }
+            ContractType::Democracy => Ok(vec![
+                bytes32_field_any(pi, payload, COMMITMENT_KEYS)?,
+                scalar_field_any_or_default(pi, payload, EPOCH_KEYS, 0)?,
+                bytes32_field_any(pi, payload, OCCUPANCY_COMMITMENT_INITIAL_KEYS)?,
+            ]),
+            ContractType::Tyranny => Ok(vec![
+                bytes32_field_any(pi, payload, COMMITMENT_KEYS)?,
+                scalar_field_any_or_default(pi, payload, EPOCH_KEYS, 0)?,
+                bytes32_field_any(pi, payload, ADMIN_PUBKEY_COMMITMENT_KEYS)?,
+                bytes32_field_any(pi, payload, GROUP_ID_FR_KEYS)
+                    .or_else(|_| bytes32_field_any(payload, payload, GROUP_ID_KEYS))?,
+            ]),
+            ContractType::Oligarchy => Err("oligarchy uses create_oligarchy_group".to_string()),
+        },
+        "create_oligarchy_group" => Ok(vec![
+            bytes32_field_any(pi, payload, COMMITMENT_KEYS)?,
+            scalar_field_any_or_default(pi, payload, EPOCH_KEYS, 0)?,
+            bytes32_field_any(pi, payload, OCCUPANCY_COMMITMENT_INITIAL_KEYS)?,
+            bytes32_field_any(pi, payload, MEMBER_ROOT_KEYS)?,
+            bytes32_field_any(pi, payload, ADMIN_ROOT_KEYS)?,
+            bytes32_field_any(pi, payload, SALT_INITIAL_KEYS)?,
+        ]),
+        "update_commitment" => update_public_inputs(contract_type, pi, payload),
+        _ => Err(format!(
+            "unsupported public inputs for function: {function}"
+        )),
+    }
+}
+
+fn create_membership_public_inputs(pi: &Value, payload: &Value) -> Result<Vec<Vec<u8>>, String> {
+    Ok(vec![
+        bytes32_field_any(pi, payload, COMMITMENT_KEYS)?,
+        scalar_field_any_or_default(pi, payload, EPOCH_KEYS, 0)?,
+    ])
+}
+
+fn membership_public_inputs(pi: &Value, payload: &Value) -> Result<Vec<Vec<u8>>, String> {
+    Ok(vec![
+        bytes32_field_any(pi, payload, COMMITMENT_KEYS)?,
+        scalar_field_any(pi, payload, EPOCH_KEYS)?,
+    ])
+}
+
+fn update_public_inputs(
+    contract_type: ContractType,
+    pi: &Value,
+    payload: &Value,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut public_inputs = vec![
+        bytes32_field_any(pi, payload, C_OLD_KEYS)?,
+        scalar_field_any(pi, payload, EPOCH_OLD_KEYS)?,
+        bytes32_field_any(pi, payload, C_NEW_KEYS)?,
+    ];
+
+    match contract_type {
+        ContractType::Anarchy => {}
+        ContractType::Democracy => {
+            public_inputs.push(bytes32_field_any(
+                pi,
+                payload,
+                OCCUPANCY_COMMITMENT_OLD_KEYS,
+            )?);
+            public_inputs.push(bytes32_field_any(
+                pi,
+                payload,
+                OCCUPANCY_COMMITMENT_NEW_KEYS,
+            )?);
+            public_inputs.push(scalar_field_any(pi, payload, THRESHOLD_NUMERATOR_KEYS)?);
+        }
+        ContractType::Oligarchy => {
+            public_inputs.push(bytes32_field_any(
+                pi,
+                payload,
+                OCCUPANCY_COMMITMENT_OLD_KEYS,
+            )?);
+            public_inputs.push(bytes32_field_any(
+                pi,
+                payload,
+                OCCUPANCY_COMMITMENT_NEW_KEYS,
+            )?);
+            public_inputs.push(scalar_field_any(
+                pi,
+                payload,
+                ADMIN_THRESHOLD_NUMERATOR_KEYS,
+            )?);
+        }
+        ContractType::Tyranny => {
+            public_inputs.push(bytes32_field_any(
+                pi,
+                payload,
+                ADMIN_PUBKEY_COMMITMENT_KEYS,
+            )?);
+            public_inputs.push(
+                bytes32_field_any(pi, payload, GROUP_ID_FR_KEYS)
+                    .or_else(|_| bytes32_field_any(payload, payload, GROUP_ID_KEYS))?,
+            );
+        }
+        ContractType::OneOnOne => {
+            return Err("oneonone contract does not support update_commitment".to_string());
+        }
     }
 
-    let pi_json = public_inputs.to_string();
-    let tmp = write_temp_json("update-public-inputs", &pi_json)?;
-    cmd.arg("--public-inputs-file-path").arg(tmp);
-    Ok(())
+    Ok(public_inputs)
 }
 
-fn decode_b64_field(payload: &Value, keys: &[&str]) -> Result<Vec<u8>, String> {
-    let b64 = field_value(payload, keys)
-        .and_then(|v| v.as_str())
+fn expected_public_input_count(
+    contract_type: ContractType,
+    function: &str,
+) -> Result<usize, String> {
+    match function {
+        "verify_membership" => Ok(2),
+        "create_group" => match contract_type {
+            ContractType::OneOnOne | ContractType::Anarchy => Ok(2),
+            ContractType::Democracy => Ok(3),
+            ContractType::Tyranny => Ok(4),
+            ContractType::Oligarchy => Err("oligarchy uses create_oligarchy_group".to_string()),
+        },
+        "create_oligarchy_group" => Ok(6),
+        "update_commitment" => match contract_type {
+            ContractType::Anarchy => Ok(3),
+            ContractType::Democracy | ContractType::Oligarchy => Ok(6),
+            ContractType::Tyranny => Ok(5),
+            ContractType::OneOnOne => {
+                Err("oneonone contract does not support update_commitment".to_string())
+            }
+        },
+        _ => Err(format!(
+            "unsupported public inputs for function: {function}"
+        )),
+    }
+}
+
+fn bytes32_field_any(primary: &Value, secondary: &Value, keys: &[&str]) -> Result<Vec<u8>, String> {
+    let value = field_value(primary, keys)
+        .or_else(|| field_value(secondary, keys))
         .ok_or_else(|| format!("missing field: {}", keys.join("/")))?;
-    base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|e| format!("invalid base64 for {}: {e}", keys.join("/")))
+    let raw = value
+        .as_str()
+        .ok_or_else(|| format!("field must be a hex or base64 string: {}", keys.join("/")))?;
+    decode_wire_bytes(raw, &keys.join("/"), Some(32))
 }
 
-fn number_field(payload: &Value, keys: &[&str]) -> Result<u64, String> {
-    field_value(payload, keys)
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| format!("missing or invalid field: {}", keys.join("/")))
+fn scalar_field_any(primary: &Value, secondary: &Value, keys: &[&str]) -> Result<Vec<u8>, String> {
+    let value = field_value(primary, keys)
+        .or_else(|| field_value(secondary, keys))
+        .ok_or_else(|| format!("missing field: {}", keys.join("/")))?;
+    scalar_value(value, &keys.join("/"))
 }
 
-fn write_temp_json(prefix: &str, contents: &str) -> Result<String, String> {
-    let timestamp_nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("system clock error: {e}"))?
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "onym-{prefix}-{}-{timestamp_nanos}.json",
-        std::process::id()
-    ));
-    std::fs::write(&path, contents)
-        .map_err(|e| format!("failed to write temp JSON file {}: {e}", path.display()))?;
-    path.into_os_string()
-        .into_string()
-        .map_err(|_| "temp JSON path is not valid UTF-8".to_string())
+fn scalar_field_any_or_default(
+    primary: &Value,
+    secondary: &Value,
+    keys: &[&str],
+    default: u64,
+) -> Result<Vec<u8>, String> {
+    match field_value(primary, keys).or_else(|| field_value(secondary, keys)) {
+        Some(value) => scalar_value(value, &keys.join("/")),
+        None => Ok(u64_be32(default).to_vec()),
+    }
+}
+
+fn scalar_value(value: &Value, field: &str) -> Result<Vec<u8>, String> {
+    if let Some(value) = value.as_u64() {
+        return Ok(u64_be32(value).to_vec());
+    }
+    if let Some(raw) = value.as_str() {
+        return decode_wire_bytes(raw, field, Some(32));
+    }
+    Err(format!(
+        "{field} must be a u64 or hex/base64 BytesN<32> string"
+    ))
+}
+
+fn decode_wire_bytes(
+    raw: &str,
+    field: &str,
+    expected_len: Option<usize>,
+) -> Result<Vec<u8>, String> {
+    let trimmed = raw.trim();
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    let looks_like_hex = match expected_len {
+        Some(expected_len) => {
+            hex.len() == expected_len * 2 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        None => !hex.is_empty() && hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+    };
+
+    let bytes = if looks_like_hex {
+        hex::decode(hex).map_err(|e| format!("invalid hex for {field}: {e}"))?
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(trimmed)
+            .map_err(|e| format!("invalid base64 for {field}: {e}"))?
+    };
+
+    if let Some(expected_len) = expected_len {
+        if bytes.len() != expected_len {
+            return Err(format!(
+                "{field} must be {expected_len} bytes, got {}",
+                bytes.len()
+            ));
+        }
+    }
+    Ok(bytes)
+}
+
+fn u64_be32(value: u64) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[24..32].copy_from_slice(&value.to_be_bytes());
+    bytes
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -828,6 +1036,30 @@ fn nibble_to_hex(nibble: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn b64_32(fill: u8) -> String {
+        b64(&[fill; 32])
+    }
+
+    fn test_config() -> Config {
+        Config {
+            secret_key: String::new(),
+            public_address: "GRELAYER".to_string(),
+            contract_ids: std::collections::HashMap::new(),
+            rpc_url: String::new(),
+            network_passphrase: String::new(),
+            network: String::new(),
+            bind_address: String::new(),
+            auth_tokens: std::collections::HashSet::new(),
+            rate_limit_per_minute: 30,
+            max_payload_size: 8192,
+            identity_name: String::new(),
+        }
+    }
 
     // ---- hex_encode tests ----
 
@@ -884,6 +1116,15 @@ mod tests {
     fn test_hex_to_base64_valid() {
         // 0xdeadbeef -> 3q2+7w==
         let result = hex_to_base64_if_needed("deadbeef").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&result)
+            .unwrap();
+        assert_eq!(decoded, vec![0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn test_hex_to_base64_accepts_0x_prefix() {
+        let result = hex_to_base64_if_needed("0xdeadbeef").unwrap();
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&result)
             .unwrap();
@@ -1006,7 +1247,7 @@ mod tests {
 
     #[test]
     fn test_add_hex_arg_accepts_snake_case_payload() {
-        let payload = serde_json::json!({ "group_id": "AAAA" }); // base64("\x00\x00\x00")
+        let payload = serde_json::json!({ "group_id": b64_32(0) });
         let mut cmd = Command::new("true");
         add_hex_arg(&mut cmd, "--group-id", &payload, GROUP_ID_KEYS)
             .expect("snake_case payload must decode");
@@ -1014,12 +1255,12 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
-        assert_eq!(args, vec!["--group-id", "000000"]);
+        assert_eq!(args, vec!["--group-id".to_string(), "00".repeat(32)]);
     }
 
     #[test]
     fn test_add_hex_arg_accepts_camel_case_payload() {
-        let payload = serde_json::json!({ "groupID": "AAAA" });
+        let payload = serde_json::json!({ "groupID": b64_32(0) });
         let mut cmd = Command::new("true");
         add_hex_arg(&mut cmd, "--group-id", &payload, GROUP_ID_KEYS)
             .expect("camelCase payload must decode");
@@ -1027,16 +1268,18 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
-        assert_eq!(args, vec!["--group-id", "000000"]);
+        assert_eq!(args, vec!["--group-id".to_string(), "00".repeat(32)]);
     }
 
     #[test]
     fn test_add_hex_arg_prefers_snake_case_when_both_present() {
         // Different base64 payloads under each key — verify we decode
-        // the snake_case one (bytes 0x01 0x02 0x03 = base64 "AQID").
+        // the snake_case one.
+        let mut snake_bytes = [0u8; 32];
+        snake_bytes[0..3].copy_from_slice(&[0x01, 0x02, 0x03]);
         let payload = serde_json::json!({
-            "group_id": "AQID",
-            "groupID":  "AAAA"
+            "group_id": b64(&snake_bytes),
+            "groupID":  b64_32(0)
         });
         let mut cmd = Command::new("true");
         add_hex_arg(&mut cmd, "--group-id", &payload, GROUP_ID_KEYS)
@@ -1045,7 +1288,10 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
-        assert_eq!(args, vec!["--group-id", "010203"]);
+        assert_eq!(
+            args,
+            vec!["--group-id".to_string(), hex_encode(&snake_bytes)]
+        );
     }
 
     #[test]
@@ -1063,6 +1309,168 @@ mod tests {
                 .collect();
             assert_eq!(args, vec!["--member-count", "7"]);
         }
+    }
+
+    #[test]
+    fn test_add_proof_arg_uses_plonk_bytesn_shape() {
+        let proof = vec![0xabu8; 1601];
+        let payload = serde_json::json!({ "proof": b64(&proof) });
+        let mut cmd = Command::new("true");
+
+        add_proof_arg(&mut cmd, &payload).expect("1601-byte proof must decode");
+
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["--proof".to_string(), hex_encode(&proof)]);
+    }
+
+    #[test]
+    fn test_democracy_create_public_inputs_object_builds_three_pi_vector() {
+        let payload = serde_json::json!({
+            "publicInputs": {
+                "commitment": b64_32(1),
+                "epoch": 0,
+                "occupancy_commitment_initial": b64_32(2)
+            }
+        });
+        let mut cmd = Command::new("true");
+
+        add_public_inputs_arg(ContractType::Democracy, "create_group", &mut cmd, &payload)
+            .expect("democracy create PI object must encode");
+
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args[0], "--public-inputs");
+        let pi: Vec<String> = serde_json::from_str(&args[1]).unwrap();
+        assert_eq!(
+            pi,
+            vec![
+                hex_encode(&[1u8; 32]),
+                hex_encode(&u64_be32(0)),
+                hex_encode(&[2u8; 32])
+            ]
+        );
+    }
+
+    #[test]
+    fn test_oligarchy_create_public_inputs_object_builds_six_pi_vector() {
+        let payload = serde_json::json!({
+            "publicInputs": {
+                "commitment": b64_32(1),
+                "epoch": 0,
+                "occupancy_commitment_initial": b64_32(2),
+                "member_root": b64_32(3),
+                "admin_root": b64_32(4),
+                "salt_initial": b64_32(5)
+            }
+        });
+        let public_inputs =
+            public_inputs_bytes(ContractType::Oligarchy, "create_oligarchy_group", &payload)
+                .expect("oligarchy create PI object must encode");
+
+        assert_eq!(
+            public_inputs,
+            vec![
+                vec![1u8; 32],
+                u64_be32(0).to_vec(),
+                vec![2u8; 32],
+                vec![3u8; 32],
+                vec![4u8; 32],
+                vec![5u8; 32]
+            ]
+        );
+    }
+
+    #[test]
+    fn test_create_oligarchy_group_args_match_current_contract_signature() {
+        let payload = serde_json::json!({
+            "group_id": b64_32(1),
+            "commitment": b64_32(2),
+            "member_tier": 0,
+            "admin_threshold_numerator": 1,
+            "occupancy_commitment_initial": b64_32(3),
+            "proof": b64(&[0xabu8; 1601]),
+            "publicInputs": {
+                "commitment": b64_32(2),
+                "epoch": 0,
+                "occupancy_commitment_initial": b64_32(3),
+                "member_root": b64_32(4),
+                "admin_root": b64_32(5),
+                "salt_initial": b64_32(6)
+            }
+        });
+        let config = test_config();
+        let mut cmd = Command::new("true");
+
+        add_create_oligarchy_group_args(&config, &mut cmd, &payload)
+            .expect("oligarchy create args must encode");
+
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"--proof".to_string()));
+        assert!(args.contains(&"--public-inputs".to_string()));
+        assert!(!args.contains(&"--member-root".to_string()));
+        assert!(!args.contains(&"--admin-root".to_string()));
+        assert!(!args.contains(&"--salt-initial".to_string()));
+    }
+
+    #[test]
+    fn test_democracy_update_public_inputs_object_builds_threshold_pi() {
+        let payload = serde_json::json!({
+            "publicInputs": {
+                "c_old": b64_32(1),
+                "epoch_old": 1234,
+                "c_new": b64_32(2),
+                "occupancy_commitment_old": b64_32(3),
+                "occupancy_commitment_new": b64_32(4),
+                "threshold_numerator": 2
+            }
+        });
+        let public_inputs =
+            public_inputs_bytes(ContractType::Democracy, "update_commitment", &payload)
+                .expect("democracy update PI object must encode");
+
+        assert_eq!(
+            public_inputs,
+            vec![
+                vec![1u8; 32],
+                u64_be32(1234).to_vec(),
+                vec![2u8; 32],
+                vec![3u8; 32],
+                vec![4u8; 32],
+                u64_be32(2).to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_tyranny_create_public_inputs_default_group_id_fr_to_group_id() {
+        let payload = serde_json::json!({
+            "group_id": b64_32(9),
+            "publicInputs": {
+                "commitment": b64_32(1),
+                "epoch": 0,
+                "admin_pubkey_commitment": b64_32(7)
+            }
+        });
+        let public_inputs = public_inputs_bytes(ContractType::Tyranny, "create_group", &payload)
+            .expect("tyranny create PI object must encode");
+
+        assert_eq!(
+            public_inputs,
+            vec![
+                vec![1u8; 32],
+                u64_be32(0).to_vec(),
+                vec![7u8; 32],
+                vec![9u8; 32]
+            ]
+        );
     }
 
     // ---- per-type entrypoint payload shape tests ----
