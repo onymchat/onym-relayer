@@ -1,0 +1,172 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Relayer release tag, for example v0.1.0"
+        required: true
+        type: string
+      deploy:
+        description: "Deploy the relayer to the DigitalOcean droplet"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_REF: onym-relayer:${{ github.sha }}
+      RELAYERS_JSON: relayers.json
+      CONTRACT_ALLOWLIST_JSON: contract-allowlist.json
+      RELAYER_ENV_FILE: relayer.env
+      IMAGE_TAR: onym-relayer-image.tar.gz
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test
+        run: |
+          cargo fmt --check
+          cargo test
+
+      - name: Generate contract allowlist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/generate-contract-allowlist.py --output "$CONTRACT_ALLOWLIST_JSON"
+          cat "$CONTRACT_ALLOWLIST_JSON"
+
+      - name: Generate relayers.json
+        run: |
+          cat > "$RELAYERS_JSON" <<'JSON'
+          {
+            "version": 1,
+            "relayers": [
+              {
+                "name": "Onym Official Testnet",
+                "url": "https://relayer-testnet.onym.chat",
+                "network": "testnet"
+              },
+              {
+                "name": "Onym Official Mainnet",
+                "url": "https://relayer.onym.chat",
+                "network": "public"
+              }
+            ]
+          }
+          JSON
+          python3 -m json.tool "$RELAYERS_JSON" >/dev/null
+
+      - name: Build deployment env
+        if: inputs.deploy
+        env:
+          RELAYER_SECRET_KEY: ${{ secrets.RELAYER_SECRET_KEY }}
+          RELAYER_AUTH_TOKENS: ${{ secrets.RELAYER_AUTH_TOKENS }}
+          RELAYER_TESTNET_RPC_URL: ${{ vars.RELAYER_TESTNET_RPC_URL }}
+          RELAYER_PUBLIC_RPC_URL: ${{ vars.RELAYER_PUBLIC_RPC_URL }}
+          RELAYER_TESTNET_NETWORK_PASSPHRASE: ${{ vars.RELAYER_TESTNET_NETWORK_PASSPHRASE }}
+          RELAYER_PUBLIC_NETWORK_PASSPHRASE: ${{ vars.RELAYER_PUBLIC_NETWORK_PASSPHRASE }}
+          RELAYER_RATE_LIMIT: ${{ vars.RELAYER_RATE_LIMIT }}
+          RELAYER_MAX_PAYLOAD_SIZE: ${{ vars.RELAYER_MAX_PAYLOAD_SIZE }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import sys
+
+          secret_key = os.environ.get("RELAYER_SECRET_KEY", "").strip()
+          if not secret_key:
+              print("RELAYER_SECRET_KEY secret is required", file=sys.stderr)
+              sys.exit(2)
+
+          with open(os.environ["CONTRACT_ALLOWLIST_JSON"], "r", encoding="utf-8") as handle:
+              allowlist = json.load(handle)
+
+          env = {
+              "RELAYER_SECRET_KEY": secret_key,
+              "RELAYER_CONTRACT_ALLOWLIST": json.dumps(allowlist, separators=(",", ":")),
+              "RELAYER_BIND": "0.0.0.0:8080",
+          }
+          optional = [
+              "RELAYER_AUTH_TOKENS",
+              "RELAYER_TESTNET_RPC_URL",
+              "RELAYER_PUBLIC_RPC_URL",
+              "RELAYER_TESTNET_NETWORK_PASSPHRASE",
+              "RELAYER_PUBLIC_NETWORK_PASSPHRASE",
+              "RELAYER_RATE_LIMIT",
+              "RELAYER_MAX_PAYLOAD_SIZE",
+          ]
+          for key in optional:
+              value = os.environ.get(key, "").strip()
+              if value:
+                  env[key] = value
+
+          with open(os.environ["RELAYER_ENV_FILE"], "w", encoding="utf-8") as handle:
+              for key in sorted(env):
+                  handle.write(f"{key}={env[key]}\n")
+          PY
+
+      - name: Build Docker image
+        if: inputs.deploy
+        run: |
+          docker build --pull -t "$IMAGE_REF" .
+          docker save "$IMAGE_REF" | gzip > "$IMAGE_TAR"
+
+      - name: Install doctl
+        if: inputs.deploy
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Deploy to DigitalOcean droplet
+        if: inputs.deploy
+        id: deploy
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          RELAYER_DROPLET_ID: ${{ secrets.RELAYER_DROPLET_ID }}
+          RELAYER_DROPLET_SSH_KEY_ID: ${{ secrets.RELAYER_DROPLET_SSH_KEY_ID }}
+          RELAYER_DROPLET_SSH_PRIVATE_KEY: ${{ secrets.RELAYER_DROPLET_SSH_PRIVATE_KEY }}
+          RELAYER_DROPLET_NAME: ${{ vars.RELAYER_DROPLET_NAME }}
+          RELAYER_DROPLET_REGION: ${{ vars.RELAYER_DROPLET_REGION }}
+          RELAYER_DROPLET_SIZE: ${{ vars.RELAYER_DROPLET_SIZE }}
+          RELAYER_CADDY_HOSTS: ${{ vars.RELAYER_CADDY_HOSTS }}
+        run: |
+          scripts/deploy-droplet.sh \
+            --env-file "$RELAYER_ENV_FILE" \
+            --image-tar "$IMAGE_TAR" \
+            --image-ref "$IMAGE_REF"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          NOTES="Onym relayer release. Fetch relayers.json from https://github.com/onymchat/onym-relayer/releases/latest/download/relayers.json"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$RELAYERS_JSON#relayers.json" --clobber
+            gh release edit "$TAG" --latest --notes "$NOTES"
+          else
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --latest \
+              --title "$TAG" \
+              --notes "$NOTES" \
+              "$RELAYERS_JSON#relayers.json"
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### Release"
+            echo "- Tag: ${{ inputs.tag }}"
+            echo "- relayers.json: https://github.com/onymchat/onym-relayer/releases/latest/download/relayers.json"
+            if [ -n "${{ steps.deploy.outputs.droplet_id }}" ]; then
+              echo "- Droplet ID: ${{ steps.deploy.outputs.droplet_id }}"
+              echo "- Droplet IP: ${{ steps.deploy.outputs.droplet_ip }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

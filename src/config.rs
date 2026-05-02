@@ -5,6 +5,105 @@ use std::str::FromStr;
 
 use serde::de::{self, Visitor};
 use serde::Deserialize;
+use serde_json::Value;
+
+/// Stellar network selected by each relayer request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Network {
+    Testnet,
+    Public,
+}
+
+impl Network {
+    pub const ALL: [Network; 2] = [Network::Testnet, Network::Public];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Network::Testnet => "testnet",
+            Network::Public => "public",
+        }
+    }
+
+    pub fn cli_network(self) -> &'static str {
+        match self {
+            Network::Testnet => "testnet",
+            Network::Public => "mainnet",
+        }
+    }
+
+    fn default_rpc_url(self) -> &'static str {
+        match self {
+            Network::Testnet => "https://soroban-testnet.stellar.org",
+            Network::Public => "https://soroban.stellar.org",
+        }
+    }
+
+    fn default_passphrase(self) -> &'static str {
+        match self {
+            Network::Testnet => "Test SDF Network ; September 2015",
+            Network::Public => "Public Global Stellar Network ; September 2015",
+        }
+    }
+
+    fn rpc_url_env(self) -> &'static str {
+        match self {
+            Network::Testnet => "RELAYER_TESTNET_RPC_URL",
+            Network::Public => "RELAYER_PUBLIC_RPC_URL",
+        }
+    }
+
+    fn passphrase_env(self) -> &'static str {
+        match self {
+            Network::Testnet => "RELAYER_TESTNET_NETWORK_PASSPHRASE",
+            Network::Public => "RELAYER_PUBLIC_NETWORK_PASSPHRASE",
+        }
+    }
+}
+
+impl fmt::Display for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl FromStr for Network {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let normalized = raw.trim().to_ascii_lowercase().replace(['-', '_', ' '], "");
+        match normalized.as_str() {
+            "testnet" | "test" => Ok(Network::Testnet),
+            "public" | "mainnet" | "pubnet" => Ok(Network::Public),
+            _ => Err(format!("unknown network: {raw}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Network {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct NetworkVisitor;
+
+        impl Visitor<'_> for NetworkVisitor {
+            type Value = Network;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("testnet, public, or mainnet")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Network::from_str(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(NetworkVisitor)
+    }
+}
 
 /// Governance-specific contract type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,32 +154,6 @@ impl ContractType {
             _ => Err(format!("unknown contract type id: {id}")),
         }
     }
-
-    fn env_keys(self) -> &'static [&'static str] {
-        match self {
-            ContractType::Anarchy => {
-                &["RELAYER_ANARCHY_CONTRACT_ID", "RELAYER_CONTRACT_ID_ANARCHY"]
-            }
-            ContractType::OneOnOne => &[
-                "RELAYER_ONEONONE_CONTRACT_ID",
-                "RELAYER_ONE_ON_ONE_CONTRACT_ID",
-                "RELAYER_1V1_CONTRACT_ID",
-                "RELAYER_CONTRACT_ID_ONEONONE",
-                "RELAYER_CONTRACT_ID_1V1",
-            ],
-            ContractType::Democracy => &[
-                "RELAYER_DEMOCRACY_CONTRACT_ID",
-                "RELAYER_CONTRACT_ID_DEMOCRACY",
-            ],
-            ContractType::Oligarchy => &[
-                "RELAYER_OLIGARCHY_CONTRACT_ID",
-                "RELAYER_CONTRACT_ID_OLIGARCHY",
-            ],
-            ContractType::Tyranny => {
-                &["RELAYER_TYRANNY_CONTRACT_ID", "RELAYER_CONTRACT_ID_TYRANNY"]
-            }
-        }
-    }
 }
 
 impl fmt::Display for ContractType {
@@ -97,7 +170,7 @@ impl FromStr for ContractType {
 
         match normalized.as_str() {
             "0" | "anarchy" | "sepanarchy" => Ok(ContractType::Anarchy),
-            "1" | "1v1" | "oneonone" | "onevone" | "sephoneonone" => Ok(ContractType::OneOnOne),
+            "1" | "1v1" | "oneonone" | "onevone" | "seponeonone" => Ok(ContractType::OneOnOne),
             "2" | "democracy" | "sepdemocracy" => Ok(ContractType::Democracy),
             "3" | "oligarchy" | "sepoligarchy" => Ok(ContractType::Oligarchy),
             "4" | "tyranny" | "septyranny" => Ok(ContractType::Tyranny),
@@ -150,20 +223,25 @@ impl<'de> Deserialize<'de> for ContractType {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct NetworkConfig {
+    pub rpc_url: String,
+    pub network_passphrase: String,
+    pub cli_network: String,
+}
+
+type ContractAllowlist = HashMap<Network, HashMap<ContractType, HashSet<String>>>;
+
 /// Relayer configuration, loaded from environment variables.
 pub struct Config {
     /// Stellar secret key (S...) for signing transactions.
     pub secret_key: String,
     /// Stellar public key (G...) derived from the secret key at startup.
     pub public_address: String,
-    /// Whitelisted contract IDs by governance type.
-    pub contract_ids: HashMap<ContractType, String>,
-    /// Soroban RPC endpoint URL.
-    pub rpc_url: String,
-    /// Network passphrase used when invoking via explicit RPC URL.
-    pub network_passphrase: String,
-    /// Stellar network name (mainnet, testnet).
-    pub network: String,
+    /// Whitelisted contract IDs by network and governance type.
+    pub contract_allowlist: ContractAllowlist,
+    /// Per-network Soroban RPC configuration.
+    pub networks: HashMap<Network, NetworkConfig>,
     /// HTTP bind address.
     pub bind_address: String,
     /// Valid bearer tokens. Empty = no auth required.
@@ -179,21 +257,8 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Result<Self, String> {
         let secret_key = require_env("RELAYER_SECRET_KEY")?;
-        let contract_ids = load_contract_ids()?;
-        let rpc_url = env::var("RELAYER_RPC_URL")
-            .unwrap_or_else(|_| "https://soroban.stellar.org".to_string());
-        let network_passphrase = env::var("RELAYER_NETWORK_PASSPHRASE").unwrap_or_else(|_| {
-            match env::var("RELAYER_NETWORK")
-                .unwrap_or_else(|_| "mainnet".to_string())
-                .as_str()
-            {
-                "testnet" => "Test SDF Network ; September 2015".to_string(),
-                "futurenet" => "Test SDF Future Network ; October 2022".to_string(),
-                "mainnet" => "Public Global Stellar Network ; September 2015".to_string(),
-                _ => String::new(),
-            }
-        });
-        let network = env::var("RELAYER_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
+        let contract_allowlist = load_contract_allowlist()?;
+        let networks = load_network_configs()?;
         let bind_address = env::var("RELAYER_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
         let auth_tokens: HashSet<String> = env::var("RELAYER_AUTH_TOKENS")
             .unwrap_or_default()
@@ -213,10 +278,8 @@ impl Config {
         Ok(Config {
             secret_key,
             public_address: String::new(), // resolved at startup
-            contract_ids,
-            rpc_url,
-            network_passphrase,
-            network,
+            contract_allowlist,
+            networks,
             bind_address,
             auth_tokens,
             rate_limit_per_minute,
@@ -229,26 +292,56 @@ impl Config {
         !self.auth_tokens.is_empty()
     }
 
-    pub fn contract_id_for(&self, contract_type: ContractType) -> Option<&str> {
-        self.contract_ids.get(&contract_type).map(String::as_str)
+    pub fn network_config(&self, network: Network) -> &NetworkConfig {
+        self.networks
+            .get(&network)
+            .expect("network configs are initialized for every supported network")
     }
 
-    pub fn contract_type_for_id(&self, contract_id: &str) -> Option<ContractType> {
-        self.contract_ids
+    pub fn contract_allowed(
+        &self,
+        network: Network,
+        contract_type: ContractType,
+        contract_id: &str,
+    ) -> bool {
+        self.contract_allowlist
+            .get(&network)
+            .and_then(|contracts| contracts.get(&contract_type))
+            .is_some_and(|contract_ids| contract_ids.contains(contract_id))
+    }
+
+    pub fn contract_type_for_id(
+        &self,
+        network: Network,
+        contract_id: &str,
+    ) -> Option<ContractType> {
+        self.contract_allowlist
+            .get(&network)?
             .iter()
-            .find_map(|(contract_type, configured_id)| {
-                (configured_id == contract_id).then_some(*contract_type)
+            .find_map(|(contract_type, contract_ids)| {
+                contract_ids.contains(contract_id).then_some(*contract_type)
             })
     }
 
-    pub fn allowed_contracts(&self) -> Vec<(ContractType, &str)> {
-        ContractType::ALL
-            .into_iter()
-            .filter_map(|contract_type| {
-                self.contract_id_for(contract_type)
-                    .map(|contract_id| (contract_type, contract_id))
-            })
-            .collect()
+    pub fn allowed_contracts(&self) -> Vec<(Network, ContractType, &str)> {
+        let mut allowed = Vec::new();
+        for network in Network::ALL {
+            for contract_type in ContractType::ALL {
+                if let Some(contract_ids) = self
+                    .contract_allowlist
+                    .get(&network)
+                    .and_then(|contracts| contracts.get(&contract_type))
+                {
+                    let mut contract_ids: Vec<&str> =
+                        contract_ids.iter().map(String::as_str).collect();
+                    contract_ids.sort_unstable();
+                    for contract_id in contract_ids {
+                        allowed.push((network, contract_type, contract_id));
+                    }
+                }
+            }
+        }
+        allowed
     }
 }
 
@@ -256,112 +349,173 @@ fn require_env(key: &str) -> Result<String, String> {
     env::var(key).map_err(|_| format!("{key} environment variable is required"))
 }
 
-fn load_contract_ids() -> Result<HashMap<ContractType, String>, String> {
-    let mut contract_ids = HashMap::new();
+fn load_network_configs() -> Result<HashMap<Network, NetworkConfig>, String> {
+    let mut networks = HashMap::new();
+    for network in Network::ALL {
+        networks.insert(
+            network,
+            NetworkConfig {
+                rpc_url: env::var(network.rpc_url_env())
+                    .unwrap_or_else(|_| network.default_rpc_url().to_string()),
+                network_passphrase: env::var(network.passphrase_env())
+                    .unwrap_or_else(|_| network.default_passphrase().to_string()),
+                cli_network: network.cli_network().to_string(),
+            },
+        );
+    }
 
-    for contract_type in ContractType::ALL {
-        for key in contract_type.env_keys() {
-            if let Ok(value) = env::var(key) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    insert_contract_id(&mut contract_ids, contract_type, value, key)?;
-                    break;
-                }
+    let legacy_rpc_url = non_empty_env("RELAYER_RPC_URL");
+    let legacy_passphrase = non_empty_env("RELAYER_NETWORK_PASSPHRASE");
+    if legacy_rpc_url.is_some() || legacy_passphrase.is_some() {
+        let network = legacy_network()?;
+        let network_config = networks
+            .get_mut(&network)
+            .expect("network configs are initialized for every supported network");
+        if let Some(rpc_url) = legacy_rpc_url {
+            network_config.rpc_url = rpc_url;
+        }
+        if let Some(passphrase) = legacy_passphrase {
+            network_config.network_passphrase = passphrase;
+        }
+    }
+
+    Ok(networks)
+}
+
+fn load_contract_allowlist() -> Result<ContractAllowlist, String> {
+    if let Some(raw) = non_empty_env("RELAYER_CONTRACT_ALLOWLIST") {
+        let parsed: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("RELAYER_CONTRACT_ALLOWLIST must be valid JSON: {e}"))?;
+        return parse_contract_allowlist(&parsed);
+    }
+
+    load_legacy_contract_allowlist()
+}
+
+fn parse_contract_allowlist(value: &Value) -> Result<ContractAllowlist, String> {
+    let networks = value
+        .as_object()
+        .ok_or("RELAYER_CONTRACT_ALLOWLIST must be a JSON object keyed by network")?;
+    let mut allowlist: ContractAllowlist = HashMap::new();
+
+    for (network_key, contracts_value) in networks {
+        let network = Network::from_str(network_key)?;
+        let contracts = contracts_value.as_object().ok_or_else(|| {
+            format!(
+                "RELAYER_CONTRACT_ALLOWLIST.{network_key} must be an object keyed by contract type"
+            )
+        })?;
+
+        for (contract_type_key, contract_ids_value) in contracts {
+            let contract_type = ContractType::from_str(contract_type_key)?;
+            let contract_ids = contract_ids_value.as_array().ok_or_else(|| {
+                format!(
+                    "RELAYER_CONTRACT_ALLOWLIST.{network_key}.{contract_type_key} must be an array"
+                )
+            })?;
+            for contract_id_value in contract_ids {
+                let contract_id = contract_id_value.as_str().ok_or_else(|| {
+                    format!(
+                        "RELAYER_CONTRACT_ALLOWLIST.{network_key}.{contract_type_key} entries must be strings"
+                    )
+                })?;
+                insert_contract_id(&mut allowlist, network, contract_type, contract_id)?;
             }
         }
     }
 
-    if let Ok(value) = env::var("RELAYER_CONTRACT_IDS") {
-        parse_contract_ids_list(&value, &mut contract_ids)?;
+    if allowlist
+        .values()
+        .flat_map(HashMap::values)
+        .all(HashSet::is_empty)
+    {
+        return Err("RELAYER_CONTRACT_ALLOWLIST must contain at least one contract ID".to_string());
     }
 
-    if contract_ids.is_empty() {
+    Ok(allowlist)
+}
+
+fn load_legacy_contract_allowlist() -> Result<ContractAllowlist, String> {
+    let network = legacy_network()?;
+    let mut allowlist: ContractAllowlist = HashMap::new();
+
+    for (contract_type, key) in LEGACY_CONTRACT_ENV_KEYS {
+        if let Some(raw_contract_ids) = non_empty_env(key) {
+            for contract_id in raw_contract_ids.split(',') {
+                insert_contract_id(&mut allowlist, network, contract_type, contract_id)?;
+            }
+        }
+    }
+
+    if allowlist
+        .values()
+        .flat_map(HashMap::values)
+        .all(HashSet::is_empty)
+    {
         return Err(
-            "at least one per-type contract ID is required (for example RELAYER_ANARCHY_CONTRACT_ID)"
+            "RELAYER_CONTRACT_ALLOWLIST or legacy RELAYER_*_CONTRACT_ID environment variables are required"
                 .to_string(),
         );
     }
 
-    Ok(contract_ids)
+    Ok(allowlist)
 }
 
-fn parse_contract_ids_list(
-    raw: &str,
-    contract_ids: &mut HashMap<ContractType, String>,
-) -> Result<(), String> {
-    for entry in raw
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-    {
-        let (left, right) = entry
-            .split_once('=')
-            .or_else(|| entry.split_once(':'))
-            .ok_or_else(|| {
-                format!(
-                    "RELAYER_CONTRACT_IDS entry must be typed as type:id or type=id, got {entry}"
-                )
-            })?;
+const LEGACY_CONTRACT_ENV_KEYS: [(ContractType, &str); 5] = [
+    (ContractType::Anarchy, "RELAYER_ANARCHY_CONTRACT_ID"),
+    (ContractType::OneOnOne, "RELAYER_ONEONONE_CONTRACT_ID"),
+    (ContractType::Democracy, "RELAYER_DEMOCRACY_CONTRACT_ID"),
+    (ContractType::Oligarchy, "RELAYER_OLIGARCHY_CONTRACT_ID"),
+    (ContractType::Tyranny, "RELAYER_TYRANNY_CONTRACT_ID"),
+];
 
-        let left_type = ContractType::from_str(left).ok();
-        let right_type = ContractType::from_str(right).ok();
-        let (contract_type, contract_id) = match (left_type, right_type) {
-            (Some(contract_type), None) => (contract_type, right.trim()),
-            (None, Some(contract_type)) => (contract_type, left.trim()),
-            (Some(_), Some(_)) => {
-                return Err(format!(
-                "RELAYER_CONTRACT_IDS entry must include one type and one contract ID, got {entry}"
-            ))
-            }
-            (None, None) => {
-                return Err(format!(
-                    "RELAYER_CONTRACT_IDS entry must include a known contract type, got {entry}"
-                ))
-            }
-        };
-
-        insert_contract_id(
-            contract_ids,
-            contract_type,
-            contract_id,
-            "RELAYER_CONTRACT_IDS",
-        )?;
+fn legacy_network() -> Result<Network, String> {
+    match non_empty_env("RELAYER_NETWORK") {
+        Some(raw) => Network::from_str(&raw),
+        None => Ok(Network::Public),
     }
+}
 
-    Ok(())
+fn non_empty_env(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn insert_contract_id(
-    contract_ids: &mut HashMap<ContractType, String>,
+    allowlist: &mut ContractAllowlist,
+    network: Network,
     contract_type: ContractType,
     contract_id: &str,
-    source: &str,
 ) -> Result<(), String> {
+    let contract_id = contract_id.trim();
     if contract_id.is_empty() {
+        return Err(format!("empty contract ID for {network}/{contract_type}"));
+    }
+    if !contract_id.starts_with('C') {
         return Err(format!(
-            "{source} has an empty contract ID for {contract_type}"
+            "contract ID for {network}/{contract_type} must start with C: {contract_id}"
         ));
     }
-
-    if let Some(existing) = contract_ids.get(&contract_type) {
-        if existing != contract_id {
+    if let Some(existing_type) = allowlist.get(&network).and_then(|contracts| {
+        contracts.iter().find_map(|(existing_type, contract_ids)| {
+            contract_ids.contains(contract_id).then_some(*existing_type)
+        })
+    }) {
+        if existing_type != contract_type {
             return Err(format!(
-                "conflicting contract IDs for {contract_type}: {existing} and {contract_id}"
+                "{network} contract ID {contract_id} is mapped to both {existing_type} and {contract_type}"
             ));
         }
-        return Ok(());
     }
 
-    if let Some((existing_type, _)) = contract_ids
-        .iter()
-        .find(|(_, existing_id)| existing_id.as_str() == contract_id)
-    {
-        return Err(format!(
-            "{source} maps contract ID {contract_id} to both {existing_type} and {contract_type}"
-        ));
-    }
-
-    contract_ids.insert(contract_type, contract_id.to_string());
+    allowlist
+        .entry(network)
+        .or_default()
+        .entry(contract_type)
+        .or_default()
+        .insert(contract_id.to_string());
     Ok(())
 }
 
@@ -369,26 +523,19 @@ fn insert_contract_id(
 mod tests {
     use super::*;
 
-    fn make_config(auth_tokens: HashSet<String>) -> Config {
-        let mut contract_ids = HashMap::new();
-        contract_ids.insert(
-            ContractType::Anarchy,
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_string(),
-        );
+    #[test]
+    fn test_network_accepts_public_and_mainnet_aliases() {
+        assert_eq!(Network::from_str("testnet").unwrap(), Network::Testnet);
+        assert_eq!(Network::from_str("mainnet").unwrap(), Network::Public);
+        assert_eq!(Network::from_str("public").unwrap(), Network::Public);
+    }
 
-        Config {
-            secret_key: String::new(),
-            public_address: String::new(),
-            contract_ids,
-            rpc_url: "https://soroban.stellar.org".to_string(),
-            network_passphrase: "Test SDF Network ; September 2015".to_string(),
-            network: "testnet".to_string(),
-            bind_address: "0.0.0.0:8080".to_string(),
-            auth_tokens,
-            rate_limit_per_minute: 30,
-            max_payload_size: 8192,
-            identity_name: "onym-relayer".to_string(),
-        }
+    #[test]
+    fn test_contract_type_accepts_sep_oneonone_alias() {
+        assert_eq!(
+            ContractType::from_str("sep-oneonone").unwrap(),
+            ContractType::OneOnOne
+        );
     }
 
     #[test]
@@ -403,5 +550,74 @@ mod tests {
     fn test_auth_not_required_without_tokens() {
         let config = make_config(HashSet::new());
         assert!(!config.auth_required());
+    }
+
+    #[test]
+    fn test_parse_contract_allowlist_by_network_and_type() {
+        let value = serde_json::json!({
+            "testnet": {
+                "anarchy": ["CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"],
+                "sep-oneonone": ["CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBQ6L2"]
+            },
+            "public": {
+                "tyranny": ["CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCQI2M"]
+            }
+        });
+        let allowlist = parse_contract_allowlist(&value).unwrap();
+
+        assert!(allowlist[&Network::Testnet][&ContractType::Anarchy]
+            .contains("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"));
+        assert!(allowlist[&Network::Testnet][&ContractType::OneOnOne]
+            .contains("CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBQ6L2"));
+        assert!(allowlist[&Network::Public][&ContractType::Tyranny]
+            .contains("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCQI2M"));
+    }
+
+    #[test]
+    fn test_parse_contract_allowlist_rejects_cross_type_duplicate_on_same_network() {
+        let value = serde_json::json!({
+            "testnet": {
+                "anarchy": ["CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"],
+                "tyranny": ["CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"]
+            }
+        });
+        let err = parse_contract_allowlist(&value).unwrap_err();
+        assert!(err.contains("mapped to both"));
+    }
+
+    fn make_config(auth_tokens: HashSet<String>) -> Config {
+        let value = serde_json::json!({
+            "testnet": {
+                "anarchy": ["CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"]
+            }
+        });
+        let mut networks = HashMap::new();
+        networks.insert(
+            Network::Testnet,
+            NetworkConfig {
+                rpc_url: String::new(),
+                network_passphrase: String::new(),
+                cli_network: "testnet".to_string(),
+            },
+        );
+        networks.insert(
+            Network::Public,
+            NetworkConfig {
+                rpc_url: String::new(),
+                network_passphrase: String::new(),
+                cli_network: "mainnet".to_string(),
+            },
+        );
+        Config {
+            secret_key: String::new(),
+            public_address: String::new(),
+            contract_allowlist: parse_contract_allowlist(&value).unwrap(),
+            networks,
+            bind_address: "0.0.0.0:8080".to_string(),
+            auth_tokens,
+            rate_limit_per_minute: 30,
+            max_payload_size: 8192,
+            identity_name: "onym-relayer".to_string(),
+        }
     }
 }

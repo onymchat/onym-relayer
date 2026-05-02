@@ -6,7 +6,7 @@ Standalone HTTP relayer for Onym Soroban contract calls.
 
 - Rust toolchain
 - `stellar` CLI available on `PATH`
-- A funded Stellar account secret key for the configured network
+- A funded Stellar account secret key for the networks the relayer will submit to
 
 ## Configuration
 
@@ -19,20 +19,43 @@ cp .env.example .env
 Required:
 
 - `RELAYER_SECRET_KEY`: Stellar secret key used to sign transactions.
-- Per-type contract IDs for the five contracts:
-  `RELAYER_ANARCHY_CONTRACT_ID`, `RELAYER_ONEONONE_CONTRACT_ID`,
-  `RELAYER_DEMOCRACY_CONTRACT_ID`, `RELAYER_OLIGARCHY_CONTRACT_ID`,
-  `RELAYER_TYRANNY_CONTRACT_ID`.
+- `RELAYER_CONTRACT_ALLOWLIST`: JSON object keyed by network and contract type.
+
+```json
+{
+  "testnet": {
+    "anarchy": ["C..."],
+    "oneonone": ["C..."],
+    "democracy": ["C..."],
+    "oligarchy": ["C..."],
+    "tyranny": ["C..."]
+  },
+  "public": {
+    "anarchy": [],
+    "oneonone": [],
+    "democracy": [],
+    "oligarchy": [],
+    "tyranny": []
+  }
+}
+```
 
 Optional:
 
-- `RELAYER_RPC_URL`: Soroban RPC endpoint.
-- `RELAYER_NETWORK_PASSPHRASE`: Explicit network passphrase.
-- `RELAYER_NETWORK`: `mainnet`, `testnet`, or `futurenet`.
+- `RELAYER_TESTNET_RPC_URL`: Testnet Soroban RPC endpoint.
+- `RELAYER_PUBLIC_RPC_URL`: Public/mainnet Soroban RPC endpoint.
+- `RELAYER_TESTNET_NETWORK_PASSPHRASE`: Testnet passphrase override.
+- `RELAYER_PUBLIC_NETWORK_PASSPHRASE`: Public/mainnet passphrase override.
 - `RELAYER_BIND`: HTTP bind address.
 - `RELAYER_AUTH_TOKENS`: Comma-separated bearer tokens. Empty disables auth.
 - `RELAYER_RATE_LIMIT`: Requests per minute per IP.
 - `RELAYER_MAX_PAYLOAD_SIZE`: Maximum JSON payload size in bytes.
+
+Legacy single-network env vars are still accepted when
+`RELAYER_CONTRACT_ALLOWLIST` is unset: `RELAYER_NETWORK`, `RELAYER_RPC_URL`,
+`RELAYER_NETWORK_PASSPHRASE`, and the five `RELAYER_*_CONTRACT_ID` variables.
+When `RELAYER_NETWORK` is unset, the legacy fallback follows the old mainnet
+default. Official deployment uses the generated allowlist.
 
 ## Run
 
@@ -52,15 +75,69 @@ Build the container image:
 docker build -t onym-relayer .
 ```
 
-Deploy to DigitalOcean App Platform:
+## Release Deployment
+
+The release workflow generates `RELAYER_CONTRACT_ALLOWLIST` from all
+`onymchat/onym-contracts` GitHub Releases, separated into `testnet` and
+`public`, deploys one Dockerized relayer to one DigitalOcean droplet, and
+publishes `relayers.json` to the latest relayer release.
+
+Required GitHub secrets:
+
+- `DIGITALOCEAN_ACCESS_TOKEN`
+- `RELAYER_SECRET_KEY`
+- `RELAYER_DROPLET_SSH_PRIVATE_KEY`
+- `RELAYER_DROPLET_SSH_KEY_ID` when the workflow must create the droplet
+
+Optional GitHub secrets:
+
+- `RELAYER_DROPLET_ID`: force reuse of a known droplet ID.
+- `RELAYER_AUTH_TOKENS`
+
+Optional GitHub variables:
+
+- `RELAYER_DROPLET_NAME`, `RELAYER_DROPLET_REGION`, `RELAYER_DROPLET_SIZE`
+- `RELAYER_CADDY_HOSTS`
+- `RELAYER_TESTNET_RPC_URL`, `RELAYER_PUBLIC_RPC_URL`
+- `RELAYER_TESTNET_NETWORK_PASSPHRASE`,
+  `RELAYER_PUBLIC_NETWORK_PASSPHRASE`
+- `RELAYER_RATE_LIMIT`, `RELAYER_MAX_PAYLOAD_SIZE`
+
+Run:
 
 ```sh
-scripts/deploy-digitalocean.sh "$DIGITALOCEAN_TOKEN" --env-file .env
+gh workflow run release.yml -f tag=v0.1.0 -f deploy=true
 ```
 
-The deploy script is idempotent by app name and registry name: it reuses or
-creates the DigitalOcean Container Registry, pushes `onym-relayer:current`, then
-creates or updates the App Platform app.
+Re-running the workflow reuses `RELAYER_DROPLET_ID` when configured, otherwise
+it reuses a droplet with the configured name. DNS for `relayer-testnet.onym.chat`
+and `relayer.onym.chat` must point at the droplet IP for Caddy TLS to issue.
+
+The release asset is always named `relayers.json` and is fetched from:
+
+```text
+https://github.com/onymchat/onym-relayer/releases/latest/download/relayers.json
+```
+
+Wire format:
+
+```json
+{
+  "version": 1,
+  "relayers": [
+    {
+      "name": "Onym Official Testnet",
+      "url": "https://relayer-testnet.onym.chat",
+      "network": "testnet"
+    },
+    {
+      "name": "Onym Official Mainnet",
+      "url": "https://relayer.onym.chat",
+      "network": "public"
+    }
+  ]
+}
+```
 
 ## API
 
@@ -68,6 +145,7 @@ The service accepts `POST /` requests with:
 
 ```json
 {
+  "network": "testnet",
   "contractID": "C...",
   "contractType": "anarchy",
   "function": "get_commitment",
@@ -77,8 +155,10 @@ The service accepts `POST /` requests with:
 }
 ```
 
-`contractID` must be one of the configured per-type IDs. `contractType` may be
-`anarchy`, `oneonone`, `democracy`, `oligarchy`, or `tyranny`.
+`network` is required and accepts `testnet`, `public`, or `mainnet`.
+`contractID` and `contractType` are required; the ID must be allowlisted for
+that type on that network. `contractType` may be `anarchy`, `oneonone`,
+`democracy`, `oligarchy`, or `tyranny`.
 
 Allowed public functions are the current per-type Soroban entrypoints:
 `create_group`, `create_oligarchy_group`, `update_commitment`,
@@ -94,13 +174,14 @@ Proof-carrying calls use the PLONK contract surface:
 
 - `proof`: 1601-byte PLONK proof, base64 or hex.
 - `publicInputs`: `Vec<BytesN<32>>`, preferably a JSON array of 32-byte hex or
-  base64 strings. Object form is also accepted for compatibility and is
-  normalized into the contract's ordered vector.
+  base64 strings. Object form is also accepted and is normalized into the
+  contract's ordered vector.
 
 Example:
 
 ```json
 {
+  "network": "testnet",
   "contractID": "C...",
   "contractType": "anarchy",
   "function": "update_commitment",

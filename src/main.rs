@@ -25,18 +25,25 @@ async fn main() {
             eprintln!(
                 "  RELAYER_SECRET_KEY     Stellar secret key (S...) for signing transactions"
             );
-            eprintln!("  RELAYER_ANARCHY_CONTRACT_ID     Anarchy contract ID (C...)");
-            eprintln!("  RELAYER_ONEONONE_CONTRACT_ID    1v1 contract ID (C...)");
-            eprintln!("  RELAYER_DEMOCRACY_CONTRACT_ID   Democracy contract ID (C...)");
-            eprintln!("  RELAYER_OLIGARCHY_CONTRACT_ID   Oligarchy contract ID (C...)");
-            eprintln!("  RELAYER_TYRANNY_CONTRACT_ID     Tyranny contract ID (C...)");
+            eprintln!(
+                "  RELAYER_CONTRACT_ALLOWLIST  JSON allowlist keyed by network and contract type"
+            );
+            eprintln!(
+                "      Legacy RELAYER_*_CONTRACT_ID vars are still accepted when RELAYER_CONTRACT_ALLOWLIST is unset"
+            );
             eprintln!();
             eprintln!("Optional:");
             eprintln!(
-                "  RELAYER_RPC_URL        Soroban RPC (default: https://soroban.stellar.org)"
+                "  RELAYER_TESTNET_RPC_URL  Soroban testnet RPC (default: https://soroban-testnet.stellar.org)"
             );
-            eprintln!("  RELAYER_NETWORK_PASSPHRASE  Network passphrase for the RPC endpoint");
-            eprintln!("  RELAYER_NETWORK        Network name (default: mainnet)");
+            eprintln!(
+                "  RELAYER_PUBLIC_RPC_URL   Soroban public RPC (default: https://soroban.stellar.org)"
+            );
+            eprintln!("  RELAYER_TESTNET_NETWORK_PASSPHRASE  Testnet passphrase override");
+            eprintln!("  RELAYER_PUBLIC_NETWORK_PASSPHRASE   Public passphrase override");
+            eprintln!(
+                "  RELAYER_RPC_URL / RELAYER_NETWORK_PASSPHRASE / RELAYER_NETWORK  Legacy single-network overrides"
+            );
             eprintln!("  RELAYER_BIND           Listen address (default: 0.0.0.0:8080)");
             eprintln!("  RELAYER_AUTH_TOKENS    Comma-separated bearer tokens (default: none)");
             eprintln!("  RELAYER_RATE_LIMIT     Requests/minute per IP (default: 30)");
@@ -103,10 +110,22 @@ async fn main() {
 
     eprintln!("Relayer address: {}", config.public_address);
     eprintln!("Allowed contracts:");
-    for (contract_type, contract_id) in config.allowed_contracts() {
-        eprintln!("  {:<14} {}", contract_type.display_name(), contract_id);
+    for (network, contract_type, contract_id) in config.allowed_contracts() {
+        eprintln!(
+            "  {:<7} {:<14} {}",
+            network,
+            contract_type.display_name(),
+            contract_id
+        );
     }
-    eprintln!("Network:        {}", config.network);
+    eprintln!("Networks:");
+    for network in config::Network::ALL {
+        let network_config = config.network_config(network);
+        eprintln!(
+            "  {:<7} {} ({})",
+            network, network_config.rpc_url, network_config.cli_network
+        );
+    }
     eprintln!("Auth required:  {}", config.auth_required());
     eprintln!(
         "Rate limit:     {} req/min per IP",
