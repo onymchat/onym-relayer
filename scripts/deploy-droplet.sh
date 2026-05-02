@@ -114,11 +114,14 @@ done
 [ -n "$IMAGE_REF" ] || die "--image-ref is required"
 [ -f "$ENV_FILE" ] || die "env file not found: $ENV_FILE"
 [ -f "$IMAGE_TAR" ] || die "image tar not found: $IMAGE_TAR"
-CADDY_HOSTS="$(normalize_caddy_hosts "$CADDY_HOSTS")"
 
 require_cmd doctl
 require_cmd ssh
 require_cmd scp
+require_cmd base64
+
+CADDY_HOSTS="$(normalize_caddy_hosts "$CADDY_HOSTS")"
+CADDY_HOSTS_B64="$(printf '%s' "$CADDY_HOSTS" | base64 | tr -d '\n')"
 
 SSH_KEY_FILE="$(mktemp "${TMPDIR:-/tmp}/onym-relayer-ssh.XXXXXX")"
 cleanup() {
@@ -196,10 +199,10 @@ scp "${SSH_OPTS[@]}" "$IMAGE_TAR" "$REMOTE:/opt/onym-relayer/image.tar.gz"
 scp "${SSH_OPTS[@]}" "$ENV_FILE" "$REMOTE:/opt/onym-relayer/relayer.env"
 
 log "installing runtime and restarting relayer"
-ssh "${SSH_OPTS[@]}" "$REMOTE" bash -s -- "$IMAGE_REF" "$CADDY_HOSTS" <<'REMOTE_SCRIPT'
+ssh "${SSH_OPTS[@]}" "$REMOTE" bash -s -- "$IMAGE_REF" "$CADDY_HOSTS_B64" <<'REMOTE_SCRIPT'
 set -euo pipefail
 IMAGE_REF="$1"
-CADDY_HOSTS="$2"
+CADDY_HOSTS="$(printf '%s' "$2" | base64 -d)"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
