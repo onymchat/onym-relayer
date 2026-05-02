@@ -80,7 +80,7 @@ docker build -t onym-relayer .
 The release workflow generates `RELAYER_CONTRACT_ALLOWLIST` from all
 `onymchat/onym-contracts` GitHub Releases, separated into `testnet` and
 `public`, deploys one Dockerized relayer to one DigitalOcean droplet, and
-publishes `relayers.json` to the latest relayer release.
+publishes the repo's validated `relayers.json` to the latest relayer release.
 
 Required GitHub secrets:
 
@@ -126,18 +126,19 @@ Wire format:
   "version": 1,
   "relayers": [
     {
-      "name": "Onym Official Testnet",
-      "url": "https://relayer-testnet.onym.chat",
-      "network": "testnet"
-    },
-    {
-      "name": "Onym Official Mainnet",
+      "name": "Onym Official",
       "url": "https://relayer.onym.chat",
-      "network": "public"
+      "networks": ["testnet", "public"]
     }
   ]
 }
 ```
+
+The relayer URL is an origin; the request body still selects the Stellar
+network with its required `network` field. Third-party operators can add their
+own relayer by opening a PR that edits the tracked `relayers.json`; the release
+workflow validates HTTPS URLs, unique origins, and supported networks before
+publishing the asset.
 
 ## API
 
