@@ -41,25 +41,9 @@ jobs:
           scripts/generate-contract-allowlist.py --output "$CONTRACT_ALLOWLIST_JSON"
           cat "$CONTRACT_ALLOWLIST_JSON"
 
-      - name: Generate relayers.json
+      - name: Validate relayers.json
         run: |
-          cat > "$RELAYERS_JSON" <<'JSON'
-          {
-            "version": 1,
-            "relayers": [
-              {
-                "name": "Onym Official Testnet",
-                "url": "https://relayer-testnet.onym.chat",
-                "network": "testnet"
-              },
-              {
-                "name": "Onym Official Mainnet",
-                "url": "https://relayer.onym.chat",
-                "network": "public"
-              }
-            ]
-          }
-          JSON
+          scripts/validate-relayers-manifest.py "$RELAYERS_JSON"
           python3 -m json.tool "$RELAYERS_JSON" >/dev/null
 
       - name: Build deployment env

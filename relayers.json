@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "relayers": [
+    {
+      "name": "Onym Official",
+      "url": "https://relayer.onym.chat",
+      "networks": ["testnet", "public"]
+    }
+  ]
+}
