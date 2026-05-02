@@ -9,7 +9,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::config::{Config, ContractType};
+use crate::config::{Config, ContractType, Network};
 use crate::validation::{self, RateLimiter, READ_ONLY_FUNCTIONS};
 
 /// Shared application state.
@@ -23,10 +23,11 @@ pub struct AppState {
 #[serde(rename_all = "camelCase")]
 pub struct RelayerRequest {
     #[serde(alias = "contractID")]
-    #[serde(default, alias = "contract_id")]
-    pub contract_id: Option<String>,
-    #[serde(default, alias = "contract_type")]
-    pub contract_type: Option<ContractType>,
+    #[serde(alias = "contract_id")]
+    pub contract_id: String,
+    #[serde(alias = "contract_type")]
+    pub contract_type: ContractType,
+    pub network: Network,
     pub function: String,
     pub payload: Value,
 }
@@ -44,6 +45,7 @@ pub struct RelayerResponse {
 
 #[derive(Clone, Debug)]
 pub struct ResolvedInvocation {
+    pub network: Network,
     pub contract_type: ContractType,
     pub contract_id: String,
     pub contract_function: String,
@@ -103,6 +105,7 @@ pub async fn handle_invoke(
     // Validate request
     if let Err(e) = validation::validate_request(
         &state.config,
+        invocation.network,
         invocation.contract_type,
         &invocation.contract_id,
         &request.function,
@@ -149,28 +152,12 @@ fn resolve_invocation(
     config: &Config,
     request: &RelayerRequest,
 ) -> Result<ResolvedInvocation, String> {
-    let id_contract_type = match request.contract_id.as_deref() {
-        Some(contract_id) => Some(
-            config
-                .contract_type_for_id(contract_id)
-                .ok_or_else(|| format!("unknown or unconfigured contract ID: {contract_id}"))?,
-        ),
-        None => None,
-    };
     let payload_contract_type = payload_contract_type(&request.payload)?;
     let implied_contract_type = implied_contract_type(&request.function)?;
 
-    let mut resolved_type = id_contract_type
-        .or(request.contract_type)
-        .or(payload_contract_type)
-        .or(implied_contract_type)
-        .ok_or_else(|| {
-            "contractID, contractType, or payload.group_type is required to select a contract"
-                .to_string()
-        })?;
+    let resolved_type = request.contract_type;
 
     for (label, maybe_contract_type) in [
-        ("contractType", request.contract_type),
         ("payload.group_type", payload_contract_type),
         ("function", implied_contract_type),
     ] {
@@ -180,25 +167,29 @@ fn resolve_invocation(
                     "{label} selects {contract_type}, but request resolves to {resolved_type}"
                 ));
             }
-            resolved_type = contract_type;
         }
     }
 
-    let contract_id = config
-        .contract_id_for(resolved_type)
-        .ok_or_else(|| format!("contract ID for {resolved_type} is not configured"))?;
-    if let Some(requested_id) = request.contract_id.as_deref() {
-        if requested_id != contract_id {
+    if !config.contract_allowed(request.network, resolved_type, &request.contract_id) {
+        if let Some(configured_type) =
+            config.contract_type_for_id(request.network, &request.contract_id)
+        {
             return Err(format!(
-                "contractID {requested_id} does not match configured {resolved_type} contract {contract_id}"
+                "contractID {} belongs to {configured_type} on {}, not {resolved_type}",
+                request.contract_id, request.network
             ));
         }
+        return Err(format!(
+            "contractID {} is not allowlisted for {resolved_type} on {}",
+            request.contract_id, request.network
+        ));
     }
 
     let contract_function = contract_function_for(resolved_type, &request.function)?;
     Ok(ResolvedInvocation {
+        network: request.network,
         contract_type: resolved_type,
-        contract_id: contract_id.to_string(),
+        contract_id: request.contract_id.clone(),
         contract_function: contract_function.to_string(),
     })
 }
@@ -407,16 +398,17 @@ async fn invoke_contract(
 ) -> Result<String, String> {
     let function = invocation.contract_function.as_str();
     let is_read_only = READ_ONLY_FUNCTIONS.contains(&function);
+    let network_config = config.network_config(invocation.network);
 
     let mut cmd = Command::new("stellar");
     cmd.arg("contract")
         .arg("invoke")
         .arg("--rpc-url")
-        .arg(&config.rpc_url)
+        .arg(&network_config.rpc_url)
         .arg("--network-passphrase")
-        .arg(&config.network_passphrase)
+        .arg(&network_config.network_passphrase)
         .arg("--network")
-        .arg(&config.network)
+        .arg(&network_config.cli_network)
         .arg("--id")
         .arg(&invocation.contract_id)
         .arg("--source-account")
@@ -1046,19 +1038,100 @@ mod tests {
     }
 
     fn test_config() -> Config {
+        let mut networks = std::collections::HashMap::new();
+        networks.insert(
+            Network::Testnet,
+            crate::config::NetworkConfig {
+                rpc_url: String::new(),
+                network_passphrase: String::new(),
+                cli_network: "testnet".to_string(),
+            },
+        );
+        networks.insert(
+            Network::Public,
+            crate::config::NetworkConfig {
+                rpc_url: String::new(),
+                network_passphrase: String::new(),
+                cli_network: "mainnet".to_string(),
+            },
+        );
         Config {
             secret_key: String::new(),
             public_address: "GRELAYER".to_string(),
-            contract_ids: std::collections::HashMap::new(),
-            rpc_url: String::new(),
-            network_passphrase: String::new(),
-            network: String::new(),
+            contract_allowlist: std::collections::HashMap::new(),
+            networks,
             bind_address: String::new(),
             auth_tokens: std::collections::HashSet::new(),
             rate_limit_per_minute: 30,
             max_payload_size: 8192,
             identity_name: String::new(),
         }
+    }
+
+    fn test_config_with_contract(
+        network: Network,
+        contract_type: ContractType,
+        contract_id: &str,
+    ) -> Config {
+        let mut config = test_config();
+        let mut contracts = std::collections::HashMap::new();
+        contracts.insert(
+            contract_type,
+            std::collections::HashSet::from([contract_id.to_string()]),
+        );
+        config.contract_allowlist.insert(network, contracts);
+        config
+    }
+
+    #[test]
+    fn test_relayer_request_deserializes_required_network_contract_and_type() {
+        let request: RelayerRequest = serde_json::from_value(serde_json::json!({
+            "network": "mainnet",
+            "contractID": "CABC",
+            "contractType": "anarchy",
+            "function": "get_commitment",
+            "payload": {}
+        }))
+        .unwrap();
+
+        assert_eq!(request.network, Network::Public);
+        assert_eq!(request.contract_id, "CABC");
+        assert_eq!(request.contract_type, ContractType::Anarchy);
+    }
+
+    #[test]
+    fn test_relayer_request_rejects_missing_network() {
+        let result = serde_json::from_value::<RelayerRequest>(serde_json::json!({
+            "contractID": "CABC",
+            "contractType": "anarchy",
+            "function": "get_commitment",
+            "payload": {}
+        }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_invocation_checks_allowlist_for_requested_network() {
+        let config = test_config_with_contract(Network::Testnet, ContractType::Anarchy, "CABC");
+        let request = RelayerRequest {
+            network: Network::Public,
+            contract_id: "CABC".to_string(),
+            contract_type: ContractType::Anarchy,
+            function: "get_commitment".to_string(),
+            payload: serde_json::json!({}),
+        };
+
+        let err = resolve_invocation(&config, &request).unwrap_err();
+        assert!(err.contains("not allowlisted"));
+
+        let request = RelayerRequest {
+            network: Network::Testnet,
+            ..request
+        };
+        let invocation = resolve_invocation(&config, &request).unwrap();
+        assert_eq!(invocation.network, Network::Testnet);
+        assert_eq!(invocation.contract_id, "CABC");
     }
 
     // ---- hex_encode tests ----

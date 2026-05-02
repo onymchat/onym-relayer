@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::config::{Config, ContractType};
+use crate::config::{Config, ContractType, Network};
 
 /// Functions that are read-only (use `--send no`).
 pub const READ_ONLY_FUNCTIONS: &[&str] = &[
@@ -30,22 +30,23 @@ const EXPECTED_PROOF_SIZE: usize = 1601;
 /// Validate a request against the relayer's security rules.
 pub fn validate_request(
     config: &Config,
+    network: Network,
     contract_type: ContractType,
     contract_id: &str,
     function: &str,
     payload: &serde_json::Value,
 ) -> Result<(), String> {
     // 1. Contract ID whitelist
-    match config.contract_type_for_id(contract_id) {
+    match config.contract_type_for_id(network, contract_id) {
         Some(configured_type) if configured_type == contract_type => {}
         Some(configured_type) => {
             return Err(format!(
-                "contract ID {contract_id} belongs to {configured_type}, not {contract_type}"
+                "contract ID {contract_id} belongs to {configured_type} on {network}, not {contract_type}"
             ));
         }
         None => {
             return Err(format!(
-                "unknown or unconfigured contract ID: {contract_id}"
+                "unknown or unconfigured contract ID for {network}: {contract_id}"
             ))
         }
     }
@@ -203,15 +204,32 @@ mod tests {
         contract_id: &str,
         auth_tokens: HashSet<String>,
     ) -> Config {
-        let mut contract_ids = HashMap::new();
-        contract_ids.insert(contract_type, contract_id.to_string());
+        let mut contracts = HashMap::new();
+        contracts.insert(contract_type, HashSet::from([contract_id.to_string()]));
+        let mut contract_allowlist = HashMap::new();
+        contract_allowlist.insert(Network::Testnet, contracts);
+        let mut networks = HashMap::new();
+        networks.insert(
+            Network::Testnet,
+            crate::config::NetworkConfig {
+                rpc_url: String::new(),
+                network_passphrase: String::new(),
+                cli_network: "testnet".to_string(),
+            },
+        );
+        networks.insert(
+            Network::Public,
+            crate::config::NetworkConfig {
+                rpc_url: String::new(),
+                network_passphrase: String::new(),
+                cli_network: "mainnet".to_string(),
+            },
+        );
         Config {
             secret_key: String::new(),
             public_address: String::new(),
-            contract_ids,
-            rpc_url: String::new(),
-            network_passphrase: String::new(),
-            network: String::new(),
+            contract_allowlist,
+            networks,
             bind_address: String::new(),
             auth_tokens,
             rate_limit_per_minute: 30,
@@ -290,6 +308,7 @@ mod tests {
         let payload = serde_json::json!({});
         assert!(validate_request(
             &config,
+            Network::Testnet,
             ContractType::Anarchy,
             "CABC123",
             "get_commitment",
@@ -304,6 +323,7 @@ mod tests {
         let payload = serde_json::json!({});
         let result = validate_request(
             &config,
+            Network::Testnet,
             ContractType::Anarchy,
             "CWRONG",
             "get_commitment",
@@ -326,7 +346,15 @@ mod tests {
             "bump_group_ttl",
         ] {
             assert!(
-                validate_request(&config, ContractType::Anarchy, "C1", func, &payload).is_ok(),
+                validate_request(
+                    &config,
+                    Network::Testnet,
+                    ContractType::Anarchy,
+                    "C1",
+                    func,
+                    &payload
+                )
+                .is_ok(),
                 "expected function '{}' to be allowed",
                 func
             );
@@ -337,7 +365,14 @@ mod tests {
     fn test_disallowed_function_rejected() {
         let config = config_no_auth("C1");
         let payload = serde_json::json!({});
-        let result = validate_request(&config, ContractType::Anarchy, "C1", "initialize", &payload);
+        let result = validate_request(
+            &config,
+            Network::Testnet,
+            ContractType::Anarchy,
+            "C1",
+            "initialize",
+            &payload,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("function not allowed"));
     }
@@ -348,6 +383,7 @@ mod tests {
         let payload = serde_json::json!({});
         let result = validate_request(
             &config,
+            Network::Testnet,
             ContractType::OneOnOne,
             "C1",
             "update_commitment",
@@ -363,6 +399,7 @@ mod tests {
         let payload = serde_json::json!({});
         assert!(validate_request(
             &config,
+            Network::Testnet,
             ContractType::Oligarchy,
             "C1",
             "create_oligarchy_group",
@@ -377,6 +414,7 @@ mod tests {
         let payload = serde_json::json!({ "restricted": true });
         let result = validate_request(
             &config,
+            Network::Testnet,
             ContractType::Anarchy,
             "C1",
             "set_restricted_mode",
@@ -392,6 +430,7 @@ mod tests {
         let payload = serde_json::json!({ "restricted": true });
         assert!(validate_request(
             &config,
+            Network::Testnet,
             ContractType::Anarchy,
             "C1",
             "set_restricted_mode",
@@ -406,6 +445,7 @@ mod tests {
         let payload = serde_json::json!({});
         assert!(validate_request(
             &anarchy,
+            Network::Testnet,
             ContractType::Anarchy,
             "C1",
             "get_admin_commitment",
@@ -416,6 +456,7 @@ mod tests {
         let tyranny = make_config(ContractType::Tyranny, "C2", HashSet::new());
         assert!(validate_request(
             &tyranny,
+            Network::Testnet,
             ContractType::Tyranny,
             "C2",
             "get_admin_commitment",
@@ -431,6 +472,7 @@ mod tests {
         let payload = serde_json::json!({ "proof": proof });
         assert!(validate_request(
             &config,
+            Network::Testnet,
             ContractType::Anarchy,
             "C1",
             "create_group",
@@ -446,6 +488,7 @@ mod tests {
         let payload = serde_json::json!({ "proof": proof });
         let result = validate_request(
             &config,
+            Network::Testnet,
             ContractType::Anarchy,
             "C1",
             "create_group",
@@ -461,6 +504,7 @@ mod tests {
         let payload = serde_json::json!({});
         assert!(validate_request(
             &config,
+            Network::Testnet,
             ContractType::Anarchy,
             "C1",
             "get_commitment",
@@ -475,6 +519,7 @@ mod tests {
         let payload = serde_json::json!({ "proof": "not-base64!!!" });
         let result = validate_request(
             &config,
+            Network::Testnet,
             ContractType::Anarchy,
             "C1",
             "create_group",
