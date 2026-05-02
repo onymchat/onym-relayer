@@ -14,7 +14,8 @@ TOKEN="${DIGITALOCEAN_ACCESS_TOKEN:-${DIGITALOCEAN_TOKEN:-}}"
 ENV_FILE=""
 IMAGE_TAR=""
 IMAGE_REF=""
-CADDY_HOSTS="${RELAYER_CADDY_HOSTS:-relayer-testnet.onym.chat, relayer.onym.chat}"
+DEFAULT_CADDY_HOSTS="relayer-testnet.onym.chat, relayer.onym.chat"
+CADDY_HOSTS="${RELAYER_CADDY_HOSTS:-$DEFAULT_CADDY_HOSTS}"
 
 usage() {
     cat <<'USAGE'
@@ -47,6 +48,36 @@ die() {
 
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+normalize_caddy_hosts() {
+    local raw="$1"
+    local normalized=""
+    local host trimmed
+    local -a hosts
+
+    if [[ "$raw" =~ (^|,)[[:space:]]*(,|$) ]]; then
+        die "RELAYER_CADDY_HOSTS contains an empty host; remove leading/trailing commas"
+    fi
+
+    IFS=',' read -r -a hosts <<< "$raw"
+    for host in "${hosts[@]}"; do
+        trimmed="$(printf '%s' "$host" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [ -n "$trimmed" ] || die "RELAYER_CADDY_HOSTS contains an empty host"
+        case "$trimmed" in
+            *[[:space:]]*|*"{"*|*"}"*)
+                die "invalid Caddy host in RELAYER_CADDY_HOSTS: $trimmed"
+                ;;
+        esac
+        if [ -z "$normalized" ]; then
+            normalized="$trimmed"
+        else
+            normalized="$normalized, $trimmed"
+        fi
+    done
+
+    [ -n "$normalized" ] || die "RELAYER_CADDY_HOSTS must contain at least one host"
+    printf '%s\n' "$normalized"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -83,6 +114,7 @@ done
 [ -n "$IMAGE_REF" ] || die "--image-ref is required"
 [ -f "$ENV_FILE" ] || die "env file not found: $ENV_FILE"
 [ -f "$IMAGE_TAR" ] || die "image tar not found: $IMAGE_TAR"
+CADDY_HOSTS="$(normalize_caddy_hosts "$CADDY_HOSTS")"
 
 require_cmd doctl
 require_cmd ssh
@@ -204,6 +236,8 @@ ${CADDY_HOSTS} {
     reverse_proxy 127.0.0.1:8080
 }
 CADDY
+
+caddy validate --config /etc/caddy/Caddyfile
 
 systemctl enable --now caddy
 systemctl reload caddy || systemctl restart caddy
