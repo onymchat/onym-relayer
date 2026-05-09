@@ -97,7 +97,7 @@ changes** — they're decoupled from contract releases.
 
 Required GitHub secrets:
 
-- `DIGITALOCEAN_ACCESS_TOKEN`
+- `DO_TOKEN` (org-wide DigitalOcean API token)
 - `RELAYER_SECRET_KEY`
 - `RELAYER_DROPLET_SSH_PRIVATE_KEY`
 - `RELAYER_DROPLET_SSH_KEY_ID` when the workflow must create the droplet
