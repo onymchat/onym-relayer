@@ -1,4 +1,8 @@
-FROM rust:1 AS builder
+# Pin builder to bookworm so its glibc matches the runtime image
+# below. `rust:1` alone now resolves to a trixie-based image (glibc
+# 2.39), and the resulting binary fails to start on bookworm-slim
+# (glibc 2.36) with `GLIBC_2.39 not found`.
+FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release
