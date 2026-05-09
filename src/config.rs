@@ -1,8 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use serde::de::{self, Visitor};
 use serde::Deserialize;
 use serde_json::Value;
@@ -230,7 +234,41 @@ pub struct NetworkConfig {
     pub cli_network: String,
 }
 
-type ContractAllowlist = HashMap<Network, HashMap<ContractType, HashSet<String>>>;
+pub type ContractAllowlist = HashMap<Network, HashMap<ContractType, HashSet<String>>>;
+
+/// Where the relayer's allowlist comes from.
+///
+/// `Static` is for offline/dev use — the env var (or legacy vars) is the
+/// single source of truth and the relayer won't try to refresh.
+/// `Remote` is the deployed-droplet path: fetch the cumulative
+/// `contracts-manifest.json` on boot and on a timer, persist a disk cache
+/// for survival across GitHub outages.
+#[derive(Debug, Clone)]
+pub enum AllowlistSource {
+    Static,
+    Remote {
+        url: String,
+        refresh_interval: Duration,
+        cache_path: Option<PathBuf>,
+    },
+}
+
+/// Default URL for the cumulative `contracts-manifest.json` published by
+/// `onymchat/onym-contracts`. This asset is regenerated on every release
+/// (release.yml's `Generate contracts manifest` step) and contains every
+/// historical deployment, not just the latest tag.
+pub const DEFAULT_MANIFEST_URL: &str =
+    "https://github.com/onymchat/onym-contracts/releases/latest/download/contracts-manifest.json";
+
+/// Default location of the on-disk last-known-good cache. Survives a
+/// GitHub-outage restart so the relayer doesn't refuse to boot if the
+/// manifest is briefly unreachable.
+pub const DEFAULT_MANIFEST_CACHE_PATH: &str = "/var/lib/onym-relayer/manifest-cache.json";
+
+/// Default poll interval for `AllowlistSource::Remote`. Manifest refreshes
+/// are cheap (single HTTPS GET) and the relayer also accepts an immediate
+/// poke via `POST /admin/refresh`, so 15 min is plenty.
+pub const DEFAULT_MANIFEST_REFRESH_SECS: u64 = 900;
 
 /// Relayer configuration, loaded from environment variables.
 pub struct Config {
@@ -238,8 +276,10 @@ pub struct Config {
     pub secret_key: String,
     /// Stellar public key (G...) derived from the secret key at startup.
     pub public_address: String,
-    /// Whitelisted contract IDs by network and governance type.
-    pub contract_allowlist: ContractAllowlist,
+    /// Whitelisted contract IDs by network and governance type. Lock-free
+    /// reads via `ArcSwap::load`; refreshes (manifest fetch / admin poke)
+    /// rebuild the whole map and atomically swap it in.
+    pub contract_allowlist: Arc<ArcSwap<ContractAllowlist>>,
     /// Per-network Soroban RPC configuration.
     pub networks: HashMap<Network, NetworkConfig>,
     /// HTTP bind address.
@@ -252,12 +292,14 @@ pub struct Config {
     pub max_payload_size: usize,
     /// Stellar CLI identity name (created from secret_key at startup).
     pub identity_name: String,
+    /// How the allowlist gets populated and refreshed.
+    pub allowlist_source: AllowlistSource,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
         let secret_key = require_env("RELAYER_SECRET_KEY")?;
-        let contract_allowlist = load_contract_allowlist()?;
+        let (initial_allowlist, allowlist_source) = load_initial_allowlist()?;
         let networks = load_network_configs()?;
         let bind_address = env::var("RELAYER_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
         let auth_tokens: HashSet<String> = env::var("RELAYER_AUTH_TOKENS")
@@ -278,13 +320,14 @@ impl Config {
         Ok(Config {
             secret_key,
             public_address: String::new(), // resolved at startup
-            contract_allowlist,
+            contract_allowlist: Arc::new(ArcSwap::from_pointee(initial_allowlist)),
             networks,
             bind_address,
             auth_tokens,
             rate_limit_per_minute,
             max_payload_size,
             identity_name: "onym-relayer".to_string(),
+            allowlist_source,
         })
     }
 
@@ -304,7 +347,8 @@ impl Config {
         contract_type: ContractType,
         contract_id: &str,
     ) -> bool {
-        self.contract_allowlist
+        let allowlist = self.contract_allowlist.load();
+        allowlist
             .get(&network)
             .and_then(|contracts| contracts.get(&contract_type))
             .is_some_and(|contract_ids| contract_ids.contains(contract_id))
@@ -315,7 +359,8 @@ impl Config {
         network: Network,
         contract_id: &str,
     ) -> Option<ContractType> {
-        self.contract_allowlist
+        let allowlist = self.contract_allowlist.load();
+        allowlist
             .get(&network)?
             .iter()
             .find_map(|(contract_type, contract_ids)| {
@@ -323,12 +368,12 @@ impl Config {
             })
     }
 
-    pub fn allowed_contracts(&self) -> Vec<(Network, ContractType, &str)> {
+    pub fn allowed_contracts(&self) -> Vec<(Network, ContractType, String)> {
+        let allowlist = self.contract_allowlist.load();
         let mut allowed = Vec::new();
         for network in Network::ALL {
             for contract_type in ContractType::ALL {
-                if let Some(contract_ids) = self
-                    .contract_allowlist
+                if let Some(contract_ids) = allowlist
                     .get(&network)
                     .and_then(|contracts| contracts.get(&contract_type))
                 {
@@ -336,12 +381,29 @@ impl Config {
                         contract_ids.iter().map(String::as_str).collect();
                     contract_ids.sort_unstable();
                     for contract_id in contract_ids {
-                        allowed.push((network, contract_type, contract_id));
+                        allowed.push((network, contract_type, contract_id.to_string()));
                     }
                 }
             }
         }
         allowed
+    }
+
+    /// Atomically replace the allowlist. Used by the manifest refresh task
+    /// and `POST /admin/refresh`.
+    pub fn replace_allowlist(&self, allowlist: ContractAllowlist) {
+        self.contract_allowlist.store(Arc::new(allowlist));
+    }
+
+    /// Total contract-ID count summed across every network/type bucket.
+    /// Logged after each refresh so an empty/shrunk allowlist is visible.
+    pub fn allowlist_size(&self) -> usize {
+        self.contract_allowlist
+            .load()
+            .values()
+            .flat_map(HashMap::values)
+            .map(HashSet::len)
+            .sum()
     }
 }
 
@@ -382,17 +444,54 @@ fn load_network_configs() -> Result<HashMap<Network, NetworkConfig>, String> {
     Ok(networks)
 }
 
-fn load_contract_allowlist() -> Result<ContractAllowlist, String> {
+/// Resolve where the allowlist comes from at startup.
+///
+/// Precedence — first match wins:
+///   1. `RELAYER_CONTRACT_ALLOWLIST` JSON env var → `Static`. Skip remote fetches.
+///   2. Legacy single-network `RELAYER_*_CONTRACT_ID` vars → `Static`.
+///   3. `RELAYER_CONTRACTS_MANIFEST_URL` (defaults to onym-contracts'
+///      `releases/latest/download/contracts-manifest.json`) → `Remote`.
+///      Initial allowlist is empty; main.rs does the first fetch before
+///      binding the listener so we never serve traffic with an empty list.
+fn load_initial_allowlist() -> Result<(ContractAllowlist, AllowlistSource), String> {
     if let Some(raw) = non_empty_env("RELAYER_CONTRACT_ALLOWLIST") {
         let parsed: Value = serde_json::from_str(&raw)
             .map_err(|e| format!("RELAYER_CONTRACT_ALLOWLIST must be valid JSON: {e}"))?;
-        return parse_contract_allowlist(&parsed);
+        let allowlist = parse_contract_allowlist(&parsed)?;
+        return Ok((allowlist, AllowlistSource::Static));
     }
 
-    load_legacy_contract_allowlist()
+    if any_legacy_contract_env_set() {
+        let allowlist = load_legacy_contract_allowlist()?;
+        return Ok((allowlist, AllowlistSource::Static));
+    }
+
+    let url = non_empty_env("RELAYER_CONTRACTS_MANIFEST_URL")
+        .unwrap_or_else(|| DEFAULT_MANIFEST_URL.to_string());
+    let refresh_interval = match non_empty_env("RELAYER_CONTRACTS_MANIFEST_REFRESH_SECS") {
+        Some(raw) => Duration::from_secs(
+            raw.parse::<u64>()
+                .map_err(|_| "RELAYER_CONTRACTS_MANIFEST_REFRESH_SECS must be a number")?,
+        ),
+        None => Duration::from_secs(DEFAULT_MANIFEST_REFRESH_SECS),
+    };
+    let cache_path = match non_empty_env("RELAYER_MANIFEST_CACHE_PATH") {
+        Some(raw) if raw == "-" => None, // explicit opt-out
+        Some(raw) => Some(PathBuf::from(raw)),
+        None => Some(PathBuf::from(DEFAULT_MANIFEST_CACHE_PATH)),
+    };
+
+    Ok((
+        HashMap::new(),
+        AllowlistSource::Remote {
+            url,
+            refresh_interval,
+            cache_path,
+        },
+    ))
 }
 
-fn parse_contract_allowlist(value: &Value) -> Result<ContractAllowlist, String> {
+pub fn parse_contract_allowlist(value: &Value) -> Result<ContractAllowlist, String> {
     let networks = value
         .as_object()
         .ok_or("RELAYER_CONTRACT_ALLOWLIST must be a JSON object keyed by network")?;
@@ -433,6 +532,12 @@ fn parse_contract_allowlist(value: &Value) -> Result<ContractAllowlist, String> 
     }
 
     Ok(allowlist)
+}
+
+fn any_legacy_contract_env_set() -> bool {
+    LEGACY_CONTRACT_ENV_KEYS
+        .iter()
+        .any(|(_, key)| non_empty_env(key).is_some())
 }
 
 fn load_legacy_contract_allowlist() -> Result<ContractAllowlist, String> {
@@ -483,7 +588,7 @@ fn non_empty_env(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn insert_contract_id(
+pub(crate) fn insert_contract_id(
     allowlist: &mut ContractAllowlist,
     network: Network,
     contract_type: ContractType,
@@ -585,7 +690,38 @@ mod tests {
         assert!(err.contains("mapped to both"));
     }
 
-    fn make_config(auth_tokens: HashSet<String>) -> Config {
+    #[test]
+    fn test_replace_allowlist_swaps_atomically() {
+        let config = make_config(HashSet::new());
+        assert!(config.contract_allowed(
+            Network::Testnet,
+            ContractType::Anarchy,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+        ));
+
+        let mut next = ContractAllowlist::new();
+        insert_contract_id(
+            &mut next,
+            Network::Public,
+            ContractType::Tyranny,
+            "CDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDU2C2",
+        )
+        .unwrap();
+        config.replace_allowlist(next);
+
+        assert!(!config.contract_allowed(
+            Network::Testnet,
+            ContractType::Anarchy,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+        ));
+        assert!(config.contract_allowed(
+            Network::Public,
+            ContractType::Tyranny,
+            "CDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDU2C2"
+        ));
+    }
+
+    pub(crate) fn make_config(auth_tokens: HashSet<String>) -> Config {
         let value = serde_json::json!({
             "testnet": {
                 "anarchy": ["CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"]
@@ -611,13 +747,16 @@ mod tests {
         Config {
             secret_key: String::new(),
             public_address: String::new(),
-            contract_allowlist: parse_contract_allowlist(&value).unwrap(),
+            contract_allowlist: Arc::new(ArcSwap::from_pointee(
+                parse_contract_allowlist(&value).unwrap(),
+            )),
             networks,
             bind_address: "0.0.0.0:8080".to_string(),
             auth_tokens,
             rate_limit_per_minute: 30,
             max_payload_size: 8192,
             identity_name: "onym-relayer".to_string(),
+            allowlist_source: AllowlistSource::Static,
         }
     }
 }

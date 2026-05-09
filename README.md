@@ -19,26 +19,31 @@ cp .env.example .env
 Required:
 
 - `RELAYER_SECRET_KEY`: Stellar secret key used to sign transactions.
-- `RELAYER_CONTRACT_ALLOWLIST`: JSON object keyed by network and contract type.
 
-```json
-{
-  "testnet": {
-    "anarchy": ["C..."],
-    "oneonone": ["C..."],
-    "democracy": ["C..."],
-    "oligarchy": ["C..."],
-    "tyranny": ["C..."]
-  },
-  "public": {
-    "anarchy": [],
-    "oneonone": [],
-    "democracy": [],
-    "oligarchy": [],
-    "tyranny": []
-  }
-}
-```
+The contract allowlist is resolved in this order — first match wins:
+
+1. **Remote manifest (default for the deployed droplet).** The relayer
+   pulls `https://github.com/onymchat/onym-contracts/releases/latest/download/contracts-manifest.json`
+   on startup and on a periodic timer (default: every 15 min). The
+   manifest is cumulative — it carries the union of every historical
+   release's contracts, not just the latest tag — so newly-deployed
+   contracts and existing ones both stay allowlisted across releases.
+   `POST /admin/refresh` (auth required) triggers an immediate refresh,
+   which is what the `onym-contracts` release workflow does at the end
+   of every release.
+2. **`RELAYER_CONTRACT_ALLOWLIST`** (JSON env var, mutually exclusive
+   with #1): static allowlist baked at startup, no remote refresh.
+   Useful for offline development and tests.
+
+   ```json
+   {
+     "testnet": { "anarchy": ["C..."], "oneonone": ["C..."], "democracy": ["C..."], "oligarchy": ["C..."], "tyranny": ["C..."] },
+     "public":  { "anarchy": [],       "oneonone": [],       "democracy": [],       "oligarchy": [],       "tyranny": [] }
+   }
+   ```
+3. **Legacy single-network vars** (`RELAYER_NETWORK`, `RELAYER_RPC_URL`,
+   `RELAYER_NETWORK_PASSPHRASE`, and the five `RELAYER_*_CONTRACT_ID`)
+   when neither #1 nor #2 is set.
 
 Optional:
 
@@ -47,15 +52,17 @@ Optional:
 - `RELAYER_TESTNET_NETWORK_PASSPHRASE`: Testnet passphrase override.
 - `RELAYER_PUBLIC_NETWORK_PASSPHRASE`: Public/mainnet passphrase override.
 - `RELAYER_BIND`: HTTP bind address.
-- `RELAYER_AUTH_TOKENS`: Comma-separated bearer tokens. Empty disables auth.
+- `RELAYER_AUTH_TOKENS`: Comma-separated bearer tokens. Empty disables
+  auth on `POST /` and disables `POST /admin/refresh` and
+  `set_restricted_mode` entirely.
 - `RELAYER_RATE_LIMIT`: Requests per minute per IP.
 - `RELAYER_MAX_PAYLOAD_SIZE`: Maximum JSON payload size in bytes.
-
-Legacy single-network env vars are still accepted when
-`RELAYER_CONTRACT_ALLOWLIST` is unset: `RELAYER_NETWORK`, `RELAYER_RPC_URL`,
-`RELAYER_NETWORK_PASSPHRASE`, and the five `RELAYER_*_CONTRACT_ID` variables.
-When `RELAYER_NETWORK` is unset, the legacy fallback follows the old mainnet
-default. Official deployment uses the generated allowlist.
+- `RELAYER_CONTRACTS_MANIFEST_URL`: override the manifest URL (default:
+  the `onymchat/onym-contracts` latest-release asset above).
+- `RELAYER_CONTRACTS_MANIFEST_REFRESH_SECS`: timer interval, default `900`.
+- `RELAYER_MANIFEST_CACHE_PATH`: last-known-good cache file. Survives
+  GitHub-outage restarts. Default:
+  `/var/lib/onym-relayer/manifest-cache.json`. Set to `-` to disable.
 
 ## Run
 
@@ -77,10 +84,16 @@ docker build -t onym-relayer .
 
 ## Release Deployment
 
-The release workflow generates `RELAYER_CONTRACT_ALLOWLIST` from all
-`onymchat/onym-contracts` GitHub Releases, separated into `testnet` and
-`public`, deploys one Dockerized relayer to one DigitalOcean droplet, and
-publishes the repo's validated `relayers.json` to the latest relayer release.
+The release workflow deploys one Dockerized relayer to one DigitalOcean
+droplet and publishes the repo's validated `relayers.json` to the latest
+relayer release. The allowlist is **not** baked into the image — the
+running relayer fetches `contracts-manifest.json` from
+`onymchat/onym-contracts/releases/latest` on boot and on a 15-min timer,
+so a new contract release is picked up automatically (or instantly via
+`POST /admin/refresh` from the contracts release workflow).
+
+This means relayer releases are now only needed for **relayer code
+changes** — they're decoupled from contract releases.
 
 Required GitHub secrets:
 
@@ -197,3 +210,20 @@ Example:
   }
 }
 ```
+
+### `POST /admin/refresh`
+
+Re-pulls `contracts-manifest.json` and atomically swaps the live
+allowlist. Bearer auth required (one of `RELAYER_AUTH_TOKENS`); returns
+503 if no auth tokens are configured, 409 when the running source is
+the static `RELAYER_CONTRACT_ALLOWLIST` env var, 200 with
+`{"ok": true, "source": "...", "contractIds": N}` on success, 502 on
+fetch/parse failure (the previous allowlist keeps serving).
+
+```sh
+curl -X POST -H "Authorization: Bearer $TOKEN" https://relayer.onym.chat/admin/refresh
+```
+
+The `onym-contracts` release workflow calls this at the tail of every
+release so newly-deployed contract addresses are usable immediately
+instead of waiting for the next periodic refresh tick.
