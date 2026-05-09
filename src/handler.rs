@@ -9,7 +9,8 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::config::{Config, ContractType, Network};
+use crate::config::{AllowlistSource, Config, ContractType, Network};
+use crate::manifest;
 use crate::validation::{self, RateLimiter, READ_ONLY_FUNCTIONS};
 
 /// Shared application state.
@@ -145,6 +146,91 @@ pub async fn handle_invoke(
             }),
         )
             .into_response(),
+    }
+}
+
+/// POST /admin/refresh — re-pull `contracts-manifest.json` and atomically
+/// swap the live allowlist.
+///
+/// Auth: requires a Bearer token from `RELAYER_AUTH_TOKENS`. If no auth
+/// tokens are configured, the endpoint returns 503 — we won't expose a
+/// privileged refresh trigger anonymously, even on a Caddy-fronted droplet.
+///
+/// Source: requires `AllowlistSource::Remote`. When the allowlist came
+/// from the legacy `RELAYER_CONTRACT_ALLOWLIST` env var, there's no URL
+/// to refresh from and the endpoint returns 409. Lets a misconfigured
+/// drop point surface as a clear error rather than a silent no-op.
+pub async fn handle_admin_refresh(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if !state.config.auth_required() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": "RELAYER_AUTH_TOKENS must be configured to enable /admin/refresh"
+            })),
+        )
+            .into_response();
+    }
+
+    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+    if let Err(e) = validation::validate_auth(&state.config, auth_header) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"ok": false, "error": e})),
+        )
+            .into_response();
+    }
+
+    let url = match &state.config.allowlist_source {
+        AllowlistSource::Remote {
+            url, cache_path, ..
+        } => (url.clone(), cache_path.clone()),
+        AllowlistSource::Static => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "error": "allowlist source is static (RELAYER_CONTRACT_ALLOWLIST or legacy env vars) — nothing to refresh"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let (manifest_url, cache_path) = url;
+
+    match manifest::fetch_and_parse(&manifest_url).await {
+        Ok((bytes, allowlist)) => {
+            let total = allowlist
+                .values()
+                .flat_map(|by_type| by_type.values())
+                .map(|ids| ids.len())
+                .sum::<usize>();
+            state.config.replace_allowlist(allowlist);
+            if let Some(path) = cache_path {
+                manifest::save_cache(&path, &bytes).await;
+            }
+            eprintln!("[manifest] refresh via /admin/refresh ok, {total} contract IDs loaded");
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "source": manifest_url,
+                    "contractIds": total
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            eprintln!("[manifest] refresh via /admin/refresh failed: {e}");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"ok": false, "error": e, "source": manifest_url})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1038,6 +1124,10 @@ mod tests {
     }
 
     fn test_config() -> Config {
+        test_config_with_allowlist(crate::config::ContractAllowlist::new())
+    }
+
+    fn test_config_with_allowlist(allowlist: crate::config::ContractAllowlist) -> Config {
         let mut networks = std::collections::HashMap::new();
         networks.insert(
             Network::Testnet,
@@ -1058,13 +1148,14 @@ mod tests {
         Config {
             secret_key: String::new(),
             public_address: "GRELAYER".to_string(),
-            contract_allowlist: std::collections::HashMap::new(),
+            contract_allowlist: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(allowlist)),
             networks,
             bind_address: String::new(),
             auth_tokens: std::collections::HashSet::new(),
             rate_limit_per_minute: 30,
             max_payload_size: 8192,
             identity_name: String::new(),
+            allowlist_source: crate::config::AllowlistSource::Static,
         }
     }
 
@@ -1073,14 +1164,14 @@ mod tests {
         contract_type: ContractType,
         contract_id: &str,
     ) -> Config {
-        let mut config = test_config();
+        let mut allowlist = crate::config::ContractAllowlist::new();
         let mut contracts = std::collections::HashMap::new();
         contracts.insert(
             contract_type,
             std::collections::HashSet::from([contract_id.to_string()]),
         );
-        config.contract_allowlist.insert(network, contracts);
-        config
+        allowlist.insert(network, contracts);
+        test_config_with_allowlist(allowlist)
     }
 
     #[test]

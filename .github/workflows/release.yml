@@ -22,7 +22,6 @@ jobs:
     env:
       IMAGE_REF: onym-relayer:${{ github.sha }}
       RELAYERS_JSON: relayers.json
-      CONTRACT_ALLOWLIST_JSON: contract-allowlist.json
       RELAYER_ENV_FILE: relayer.env
       IMAGE_TAR: onym-relayer-image.tar.gz
     steps:
@@ -34,19 +33,18 @@ jobs:
           cargo fmt --check
           cargo test
 
-      - name: Generate contract allowlist
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          scripts/generate-contract-allowlist.py --output "$CONTRACT_ALLOWLIST_JSON"
-          cat "$CONTRACT_ALLOWLIST_JSON"
-
       - name: Validate relayers.json
         run: |
           scripts/validate-relayers-manifest.py "$RELAYERS_JSON"
           python3 -m json.tool "$RELAYERS_JSON" >/dev/null
 
       - name: Build deployment env
+        # No `RELAYER_CONTRACT_ALLOWLIST` is baked into the env file.
+        # The relayer pulls the cumulative
+        # `https://github.com/onymchat/onym-contracts/releases/latest/download/contracts-manifest.json`
+        # at startup and on a 15-min timer, and accepts an immediate
+        # poke from `onym-contracts` release.yml via POST /admin/refresh.
+        # That decouples relayer redeploys from contract releases.
         if: inputs.deploy
         env:
           RELAYER_SECRET_KEY: ${{ secrets.RELAYER_SECRET_KEY }}
@@ -57,9 +55,10 @@ jobs:
           RELAYER_PUBLIC_NETWORK_PASSPHRASE: ${{ vars.RELAYER_PUBLIC_NETWORK_PASSPHRASE }}
           RELAYER_RATE_LIMIT: ${{ vars.RELAYER_RATE_LIMIT }}
           RELAYER_MAX_PAYLOAD_SIZE: ${{ vars.RELAYER_MAX_PAYLOAD_SIZE }}
+          RELAYER_CONTRACTS_MANIFEST_URL: ${{ vars.RELAYER_CONTRACTS_MANIFEST_URL }}
+          RELAYER_CONTRACTS_MANIFEST_REFRESH_SECS: ${{ vars.RELAYER_CONTRACTS_MANIFEST_REFRESH_SECS }}
         run: |
           python3 <<'PY'
-          import json
           import os
           import sys
 
@@ -68,13 +67,16 @@ jobs:
               print("RELAYER_SECRET_KEY secret is required", file=sys.stderr)
               sys.exit(2)
 
-          with open(os.environ["CONTRACT_ALLOWLIST_JSON"], "r", encoding="utf-8") as handle:
-              allowlist = json.load(handle)
-
           env = {
               "RELAYER_SECRET_KEY": secret_key,
-              "RELAYER_CONTRACT_ALLOWLIST": json.dumps(allowlist, separators=(",", ":")),
               "RELAYER_BIND": "0.0.0.0:8080",
+              # The container has no writable host volume mounted by
+              # default; keep the cache inside /tmp so a restart doesn't
+              # block on a missing path. Fresh pod = first fetch from
+              # GitHub; outage at boot = empty cache → exit. Acceptable
+              # because the bootstrap timeout is 15s and a fresh container
+              # is the only failure mode anyway.
+              "RELAYER_MANIFEST_CACHE_PATH": "/tmp/onym-relayer/manifest-cache.json",
           }
           optional = [
               "RELAYER_AUTH_TOKENS",
@@ -84,6 +86,8 @@ jobs:
               "RELAYER_PUBLIC_NETWORK_PASSPHRASE",
               "RELAYER_RATE_LIMIT",
               "RELAYER_MAX_PAYLOAD_SIZE",
+              "RELAYER_CONTRACTS_MANIFEST_URL",
+              "RELAYER_CONTRACTS_MANIFEST_REFRESH_SECS",
           ]
           for key in optional:
               value = os.environ.get(key, "").strip()

@@ -228,13 +228,16 @@ mod tests {
         Config {
             secret_key: String::new(),
             public_address: String::new(),
-            contract_allowlist,
+            contract_allowlist: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                contract_allowlist,
+            )),
             networks,
             bind_address: String::new(),
             auth_tokens,
             rate_limit_per_minute: 30,
             max_payload_size: 8192,
             identity_name: String::new(),
+            allowlist_source: crate::config::AllowlistSource::Static,
         }
     }
 
