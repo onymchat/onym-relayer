@@ -109,13 +109,13 @@ jobs:
         if: inputs.deploy
         uses: digitalocean/action-doctl@v2
         with:
-          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          token: ${{ secrets.DO_TOKEN }}
 
       - name: Deploy to DigitalOcean droplet
         if: inputs.deploy
         id: deploy
         env:
-          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          DO_TOKEN: ${{ secrets.DO_TOKEN }}
           RELAYER_DROPLET_ID: ${{ secrets.RELAYER_DROPLET_ID }}
           RELAYER_DROPLET_SSH_KEY_ID: ${{ secrets.RELAYER_DROPLET_SSH_KEY_ID }}
           RELAYER_DROPLET_SSH_PRIVATE_KEY: ${{ secrets.RELAYER_DROPLET_SSH_PRIVATE_KEY }}

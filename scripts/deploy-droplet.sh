@@ -10,7 +10,7 @@ DROPLET_ID="${RELAYER_DROPLET_ID:-}"
 SSH_USER="${RELAYER_DROPLET_SSH_USER:-root}"
 SSH_KEY_ID="${RELAYER_DROPLET_SSH_KEY_ID:-${DROPLET_SSH_KEY_ID:-}}"
 SSH_PRIVATE_KEY="${RELAYER_DROPLET_SSH_PRIVATE_KEY:-${DROPLET_SSH_PRIVATE_KEY:-}}"
-TOKEN="${DIGITALOCEAN_ACCESS_TOKEN:-${DIGITALOCEAN_TOKEN:-}}"
+TOKEN="${DO_TOKEN:-${DIGITALOCEAN_ACCESS_TOKEN:-${DIGITALOCEAN_TOKEN:-}}}"
 ENV_FILE=""
 IMAGE_TAR=""
 IMAGE_REF=""
@@ -23,7 +23,7 @@ Usage:
   scripts/deploy-droplet.sh --env-file <path> --image-tar <path> --image-ref <name:tag>
 
 Required environment:
-  DIGITALOCEAN_ACCESS_TOKEN
+  DO_TOKEN (or legacy DIGITALOCEAN_ACCESS_TOKEN / DIGITALOCEAN_TOKEN)
   RELAYER_DROPLET_SSH_KEY_ID or DROPLET_SSH_KEY_ID
   RELAYER_DROPLET_SSH_PRIVATE_KEY or DROPLET_SSH_PRIVATE_KEY
 
@@ -107,7 +107,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-[ -n "$TOKEN" ] || die "DIGITALOCEAN_ACCESS_TOKEN is required"
+[ -n "$TOKEN" ] || die "DO_TOKEN is required"
 [ -n "$SSH_PRIVATE_KEY" ] || die "RELAYER_DROPLET_SSH_PRIVATE_KEY is required"
 [ -n "$ENV_FILE" ] || die "--env-file is required"
 [ -n "$IMAGE_TAR" ] || die "--image-tar is required"
