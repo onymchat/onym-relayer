@@ -309,7 +309,7 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
         let rate_limit_per_minute: u32 = env::var("RELAYER_RATE_LIMIT")
-            .unwrap_or_else(|_| "30".to_string())
+            .unwrap_or_else(|_| "120".to_string())
             .parse()
             .map_err(|_| "RELAYER_RATE_LIMIT must be a number")?;
         let max_payload_size: usize = env::var("RELAYER_MAX_PAYLOAD_SIZE")
