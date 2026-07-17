@@ -3,7 +3,7 @@
   "relayers": [
     {
       "name": "Onym Official",
-      "url": "https://relayer.onym.chat",
+      "url": "https://relayer.onym.app",
       "networks": ["testnet", "public"]
     }
   ]
