@@ -1,5 +1,13 @@
 name: Release
 
+# Publishes relayers.json as the `latest` GitHub Release asset — the
+# client discovery manifest the app fetches from
+# releases/latest/download/relayers.json.
+#
+# Droplet deployment now lives in the onym-infra repo (which runs the
+# relayer alongside nostr + blossom on one box). This workflow no longer
+# builds an image or touches any server.
+
 on:
   workflow_dispatch:
     inputs:
@@ -7,11 +15,6 @@ on:
         description: "Relayer release tag, for example v0.1.0"
         required: true
         type: string
-      deploy:
-        description: "Deploy the relayer to the DigitalOcean droplet"
-        required: true
-        default: true
-        type: boolean
 
 permissions:
   contents: write
@@ -20,10 +23,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     env:
-      IMAGE_REF: onym-relayer:${{ github.sha }}
       RELAYERS_JSON: relayers.json
-      RELAYER_ENV_FILE: relayer.env
-      IMAGE_TAR: onym-relayer-image.tar.gz
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,97 +37,6 @@ jobs:
         run: |
           scripts/validate-relayers-manifest.py "$RELAYERS_JSON"
           python3 -m json.tool "$RELAYERS_JSON" >/dev/null
-
-      - name: Build deployment env
-        # No `RELAYER_CONTRACT_ALLOWLIST` is baked into the env file.
-        # The relayer pulls the cumulative
-        # `https://github.com/onymchat/onym-contracts/releases/latest/download/contracts-manifest.json`
-        # at startup and on a 15-min timer, and accepts an immediate
-        # poke from `onym-contracts` release.yml via POST /admin/refresh.
-        # That decouples relayer redeploys from contract releases.
-        if: inputs.deploy
-        env:
-          RELAYER_SECRET_KEY: ${{ secrets.RELAYER_SECRET_KEY }}
-          RELAYER_AUTH_TOKENS: ${{ secrets.RELAYER_AUTH_TOKENS }}
-          RELAYER_TESTNET_RPC_URL: ${{ vars.RELAYER_TESTNET_RPC_URL }}
-          RELAYER_PUBLIC_RPC_URL: ${{ vars.RELAYER_PUBLIC_RPC_URL }}
-          RELAYER_TESTNET_NETWORK_PASSPHRASE: ${{ vars.RELAYER_TESTNET_NETWORK_PASSPHRASE }}
-          RELAYER_PUBLIC_NETWORK_PASSPHRASE: ${{ vars.RELAYER_PUBLIC_NETWORK_PASSPHRASE }}
-          RELAYER_RATE_LIMIT: ${{ vars.RELAYER_RATE_LIMIT }}
-          RELAYER_MAX_PAYLOAD_SIZE: ${{ vars.RELAYER_MAX_PAYLOAD_SIZE }}
-          RELAYER_CONTRACTS_MANIFEST_URL: ${{ vars.RELAYER_CONTRACTS_MANIFEST_URL }}
-          RELAYER_CONTRACTS_MANIFEST_REFRESH_SECS: ${{ vars.RELAYER_CONTRACTS_MANIFEST_REFRESH_SECS }}
-        run: |
-          python3 <<'PY'
-          import os
-          import sys
-
-          secret_key = os.environ.get("RELAYER_SECRET_KEY", "").strip()
-          if not secret_key:
-              print("RELAYER_SECRET_KEY secret is required", file=sys.stderr)
-              sys.exit(2)
-
-          env = {
-              "RELAYER_SECRET_KEY": secret_key,
-              "RELAYER_BIND": "0.0.0.0:8080",
-              # The container has no writable host volume mounted by
-              # default; keep the cache inside /tmp so a restart doesn't
-              # block on a missing path. Fresh pod = first fetch from
-              # GitHub; outage at boot = empty cache → exit. Acceptable
-              # because the bootstrap timeout is 15s and a fresh container
-              # is the only failure mode anyway.
-              "RELAYER_MANIFEST_CACHE_PATH": "/tmp/onym-relayer/manifest-cache.json",
-          }
-          optional = [
-              "RELAYER_AUTH_TOKENS",
-              "RELAYER_TESTNET_RPC_URL",
-              "RELAYER_PUBLIC_RPC_URL",
-              "RELAYER_TESTNET_NETWORK_PASSPHRASE",
-              "RELAYER_PUBLIC_NETWORK_PASSPHRASE",
-              "RELAYER_RATE_LIMIT",
-              "RELAYER_MAX_PAYLOAD_SIZE",
-              "RELAYER_CONTRACTS_MANIFEST_URL",
-              "RELAYER_CONTRACTS_MANIFEST_REFRESH_SECS",
-          ]
-          for key in optional:
-              value = os.environ.get(key, "").strip()
-              if value:
-                  env[key] = value
-
-          with open(os.environ["RELAYER_ENV_FILE"], "w", encoding="utf-8") as handle:
-              for key in sorted(env):
-                  handle.write(f"{key}={env[key]}\n")
-          PY
-
-      - name: Build Docker image
-        if: inputs.deploy
-        run: |
-          docker build --pull -t "$IMAGE_REF" .
-          docker save "$IMAGE_REF" | gzip > "$IMAGE_TAR"
-
-      - name: Install doctl
-        if: inputs.deploy
-        uses: digitalocean/action-doctl@v2
-        with:
-          token: ${{ secrets.DO_TOKEN }}
-
-      - name: Deploy to DigitalOcean droplet
-        if: inputs.deploy
-        id: deploy
-        env:
-          DO_TOKEN: ${{ secrets.DO_TOKEN }}
-          RELAYER_DROPLET_ID: ${{ secrets.RELAYER_DROPLET_ID }}
-          RELAYER_DROPLET_SSH_KEY_ID: ${{ secrets.RELAYER_DROPLET_SSH_KEY_ID }}
-          RELAYER_DROPLET_SSH_PRIVATE_KEY: ${{ secrets.RELAYER_DROPLET_SSH_PRIVATE_KEY }}
-          RELAYER_DROPLET_NAME: ${{ vars.RELAYER_DROPLET_NAME }}
-          RELAYER_DROPLET_REGION: ${{ vars.RELAYER_DROPLET_REGION }}
-          RELAYER_DROPLET_SIZE: ${{ vars.RELAYER_DROPLET_SIZE }}
-          RELAYER_CADDY_HOSTS: ${{ vars.RELAYER_CADDY_HOSTS }}
-        run: |
-          scripts/deploy-droplet.sh \
-            --env-file "$RELAYER_ENV_FILE" \
-            --image-tar "$IMAGE_TAR" \
-            --image-ref "$IMAGE_REF"
 
       - name: Create or update GitHub Release
         env:
@@ -153,8 +62,4 @@ jobs:
             echo "### Release"
             echo "- Tag: ${{ inputs.tag }}"
             echo "- relayers.json: https://github.com/onymchat/onym-relayer/releases/latest/download/relayers.json"
-            if [ -n "${{ steps.deploy.outputs.droplet_id }}" ]; then
-              echo "- Droplet ID: ${{ steps.deploy.outputs.droplet_id }}"
-              echo "- Droplet IP: ${{ steps.deploy.outputs.droplet_ip }}"
-            fi
           } >> "$GITHUB_STEP_SUMMARY"
