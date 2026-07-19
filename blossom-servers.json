@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "servers": [
+    {
+      "name": "Onym Official",
+      "url": "https://blossom.onym.app",
+      "isDefault": true
+    }
+  ]
+}

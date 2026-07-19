@@ -14,7 +14,7 @@ TOKEN="${DO_TOKEN:-${DIGITALOCEAN_ACCESS_TOKEN:-${DIGITALOCEAN_TOKEN:-}}}"
 ENV_FILE=""
 IMAGE_TAR=""
 IMAGE_REF=""
-DEFAULT_CADDY_HOSTS="relayer-testnet.onym.chat, relayer.onym.chat"
+DEFAULT_CADDY_HOSTS="relayer-testnet.onym.app, relayer.onym.app"
 CADDY_HOSTS="${RELAYER_CADDY_HOSTS:-$DEFAULT_CADDY_HOSTS}"
 
 usage() {
@@ -33,7 +33,7 @@ Optional environment:
   RELAYER_DROPLET_REGION      Default: nyc3.
   RELAYER_DROPLET_SIZE        Default: s-1vcpu-1gb.
   RELAYER_DROPLET_IMAGE       Default: ubuntu-24-04-x64.
-  RELAYER_CADDY_HOSTS         Default: relayer-testnet.onym.chat, relayer.onym.chat.
+  RELAYER_CADDY_HOSTS         Default: relayer-testnet.onym.app, relayer.onym.app.
 USAGE
 }
 

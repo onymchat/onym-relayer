@@ -123,8 +123,8 @@ gh workflow run release.yml -f tag=v0.1.0 -f deploy=true
 ```
 
 Re-running the workflow reuses `RELAYER_DROPLET_ID` when configured, otherwise
-it reuses a droplet with the configured name. DNS for `relayer-testnet.onym.chat`
-and `relayer.onym.chat` must point at the droplet IP for Caddy TLS to issue.
+it reuses a droplet with the configured name. DNS for `relayer-testnet.onym.app`
+and `relayer.onym.app` must point at the droplet IP for Caddy TLS to issue.
 
 The release asset is always named `relayers.json` and is fetched from:
 
@@ -140,7 +140,7 @@ Wire format:
   "relayers": [
     {
       "name": "Onym Official",
-      "url": "https://relayer.onym.chat",
+      "url": "https://relayer.onym.app",
       "networks": ["testnet", "public"]
     }
   ]
@@ -152,6 +152,47 @@ network with its required `network` field. Third-party operators can add their
 own relayer by opening a PR that edits the tracked `relayers.json`; the release
 workflow validates HTTPS URLs, unique origins, and supported networks before
 publishing the asset.
+
+### Transport manifests (Nostr relays + Blossom servers)
+
+The same release publishes two more client-discovery manifests, fetched the
+same way from `releases/latest/download/<asset>`:
+
+```text
+https://github.com/onymchat/onym-relayer/releases/latest/download/nostr-relays.json
+https://github.com/onymchat/onym-relayer/releases/latest/download/blossom-servers.json
+```
+
+Both share the shape `{ "version": 1, "<key>": [ { "name", "url", "isDefault" } ] }`
+and are validated by `scripts/validate-server-manifest.py` (Nostr URLs must be
+`wss://`/`ws://`; Blossom URLs `https://`/`http://`; at most one `isDefault`).
+
+`nostr-relays.json` — the apps connect to **every** listed relay (fan-out):
+
+```json
+{
+  "version": 1,
+  "relays": [
+    { "name": "Onym Official", "url": "wss://nostr.onym.app", "isDefault": true }
+  ]
+}
+```
+
+`blossom-servers.json` — the apps upload/download media via the **first** listed
+server (so order matters; put the primary first):
+
+```json
+{
+  "version": 1,
+  "servers": [
+    { "name": "Onym Official", "url": "https://blossom.onym.app", "isDefault": true }
+  ]
+}
+```
+
+The apps seed a hardcoded default at first launch (offline-proof), then refresh
+from these manifests in the background; a user's own custom entries are never
+overwritten, and "Restore default" re-fetches the published list.
 
 ## API
 
@@ -221,7 +262,7 @@ the static `RELAYER_CONTRACT_ALLOWLIST` env var, 200 with
 fetch/parse failure (the previous allowlist keeps serving).
 
 ```sh
-curl -X POST -H "Authorization: Bearer $TOKEN" https://relayer.onym.chat/admin/refresh
+curl -X POST -H "Authorization: Bearer $TOKEN" https://relayer.onym.app/admin/refresh
 ```
 
 The `onym-contracts` release workflow calls this at the tail of every

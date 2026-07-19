@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "relays": [
+    {
+      "name": "Onym Official",
+      "url": "wss://nostr.onym.app",
+      "isDefault": true
+    }
+  ]
+}

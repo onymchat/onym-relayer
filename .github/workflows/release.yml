@@ -1,8 +1,10 @@
 name: Release
 
-# Publishes relayers.json as the `latest` GitHub Release asset — the
-# client discovery manifest the app fetches from
-# releases/latest/download/relayers.json.
+# Publishes the client discovery manifests as `latest` GitHub Release
+# assets — the apps fetch them from releases/latest/download/<asset>:
+#   - relayers.json       (chain relayer directory)
+#   - nostr-relays.json   (Nostr inbox-transport relay directory)
+#   - blossom-servers.json (Blossom media-server directory)
 #
 # Droplet deployment now lives in the onym-infra repo (which runs the
 # relayer alongside nostr + blossom on one box). This workflow no longer
@@ -24,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELAYERS_JSON: relayers.json
+      NOSTR_RELAYS_JSON: nostr-relays.json
+      BLOSSOM_SERVERS_JSON: blossom-servers.json
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,19 +37,28 @@ jobs:
           cargo fmt --check
           cargo test
 
-      - name: Validate relayers.json
+      - name: Validate manifests
         run: |
           scripts/validate-relayers-manifest.py "$RELAYERS_JSON"
           python3 -m json.tool "$RELAYERS_JSON" >/dev/null
+          scripts/validate-server-manifest.py --key relays --schemes wss,ws "$NOSTR_RELAYS_JSON"
+          python3 -m json.tool "$NOSTR_RELAYS_JSON" >/dev/null
+          scripts/validate-server-manifest.py --key servers --schemes https,http "$BLOSSOM_SERVERS_JSON"
+          python3 -m json.tool "$BLOSSOM_SERVERS_JSON" >/dev/null
 
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
         run: |
-          NOTES="Onym relayer release. Fetch relayers.json from https://github.com/onymchat/onym-relayer/releases/latest/download/relayers.json"
+          BASE="https://github.com/onymchat/onym-relayer/releases/latest/download"
+          NOTES="Onym client discovery manifests. Fetch: $BASE/relayers.json · $BASE/nostr-relays.json · $BASE/blossom-servers.json"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$RELAYERS_JSON#relayers.json" --clobber
+            gh release upload "$TAG" \
+              "$RELAYERS_JSON#relayers.json" \
+              "$NOSTR_RELAYS_JSON#nostr-relays.json" \
+              "$BLOSSOM_SERVERS_JSON#blossom-servers.json" \
+              --clobber
             gh release edit "$TAG" --latest --notes "$NOTES"
           else
             gh release create "$TAG" \
@@ -53,13 +66,18 @@ jobs:
               --latest \
               --title "$TAG" \
               --notes "$NOTES" \
-              "$RELAYERS_JSON#relayers.json"
+              "$RELAYERS_JSON#relayers.json" \
+              "$NOSTR_RELAYS_JSON#nostr-relays.json" \
+              "$BLOSSOM_SERVERS_JSON#blossom-servers.json"
           fi
 
       - name: Summary
         run: |
+          BASE="https://github.com/onymchat/onym-relayer/releases/latest/download"
           {
             echo "### Release"
             echo "- Tag: ${{ inputs.tag }}"
-            echo "- relayers.json: https://github.com/onymchat/onym-relayer/releases/latest/download/relayers.json"
+            echo "- relayers.json: $BASE/relayers.json"
+            echo "- nostr-relays.json: $BASE/nostr-relays.json"
+            echo "- blossom-servers.json: $BASE/blossom-servers.json"
           } >> "$GITHUB_STEP_SUMMARY"
