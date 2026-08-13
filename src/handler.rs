@@ -17,6 +17,8 @@ use crate::validation::{self, RateLimiter, READ_ONLY_FUNCTIONS};
 pub struct AppState {
     pub config: Config,
     pub rate_limiter: RateLimiter,
+    /// Verified at boot; served byte-for-byte. None = endpoint absent.
+    pub operator_manifest: Option<crate::operator_manifest::OperatorManifest>,
 }
 
 /// Incoming request from mobile apps.
@@ -1715,5 +1717,45 @@ mod tests {
             Some(10)
         );
         assert!(field_value(&neither, MAX_ENTRIES_KEYS).is_none());
+    }
+}
+
+/// `GET /manifest.json` — the relayer's signed notary-operator
+/// manifest, served **byte-for-byte**. Discovery catalogs and group
+/// bindings pin the SHA-256 of exactly these bytes; re-serialization
+/// here would break every pin. 404 when the deployment has not
+/// published a manifest (`RELAYER_OPERATOR_MANIFEST` unset).
+pub async fn handle_operator_manifest(State(state): State<Arc<AppState>>) -> Response {
+    match &state.operator_manifest {
+        Some(manifest) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            manifest.raw.clone(),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "this deployment publishes no operator manifest" })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /manifest.json.sig` — the detached form of the manifest's
+/// embedded Ed25519 signature, for tooling that verifies before
+/// parsing (the same convention the moderation authority serves).
+pub async fn handle_operator_manifest_sig(State(state): State<Arc<AppState>>) -> Response {
+    match &state.operator_manifest {
+        Some(manifest) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            format!("{}\n", manifest.detached_signature),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "this deployment publishes no operator manifest" })),
+        )
+            .into_response(),
     }
 }

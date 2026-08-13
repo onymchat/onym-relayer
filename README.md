@@ -57,6 +57,13 @@ Optional:
   `set_restricted_mode` entirely.
 - `RELAYER_RATE_LIMIT`: Requests per minute per IP.
 - `RELAYER_MAX_PAYLOAD_SIZE`: Maximum JSON payload size in bytes.
+- `RELAYER_OPERATOR_MANIFEST`: Path to the signed notary-operator
+  manifest (see `onym-system/notary/UI-Notary-BNB.md` §8.1), signed
+  offline with the `onym-discovery` CLI. When set, it is verified at
+  boot (the process refuses to start on an invalid signature) and
+  served byte-for-byte at `GET /manifest.json`, with the detached
+  signature at `GET /manifest.json.sig`. Unset: the endpoints return
+  404 and nothing else changes.
 - `RELAYER_CONTRACTS_MANIFEST_URL`: override the manifest URL (default:
   the `onymchat/onym-contracts` latest-release asset above).
 - `RELAYER_CONTRACTS_MANIFEST_REFRESH_SECS`: timer interval, default `900`.

@@ -13,6 +13,7 @@ serde_json = "1"
 tower-http = { version = "0.5", features = ["limit"] }
 base64 = "0.22"
 hex = "0.4"
+ed25519-dalek = "2"
 # rustls-tls keeps us off OpenSSL — the runtime image is debian:bookworm-slim
 # without libssl. webpki-roots is bundled into the rustls feature, so no
 # system trust store is required either.
