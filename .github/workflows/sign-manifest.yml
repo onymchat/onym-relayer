@@ -20,9 +20,10 @@ name: Sign operator manifest
 #   * DigitalOcean App Platform (scripts/deploy-digitalocean.sh
 #     conventions: app "onym-relayer", service "relayer", DOCR image
 #     onym-relayer:current with deploy_on_push): the default. Requires
-#     the org-level DO_API_KEY secret; the workflow pushes a fresh
-#     image, sets RELAYER_OPERATOR_MANIFEST in the app spec, waits, and
-#     verifies strictly.
+#     the org-level DO_API_KEY secret; the workflow sets
+#     RELAYER_OPERATOR_MANIFEST in the app spec (waits on that
+#     deployment), then pushes a fresh image — deploy_on_push deploys
+#     it against the updated spec — and verifies strictly.
 #   * onym-infra droplet (docker-compose; the relayer is a git
 #     submodule there): run with skip_deploy=true, then bump the
 #     relayer submodule in onym-infra, add
@@ -221,7 +222,14 @@ jobs:
         id: commit
         run: |
           rm -f "$RUNNER_TEMP/operator.seed"
-          git add "$MANIFEST_SRC" "$MANIFEST_OUT" "$MANIFEST_OUT.sig"
+          # The pinned signer writes a detached "$MANIFEST_OUT.sig"
+          # sibling (verified against PINNED_SIGNER_REV: sign-manifest
+          # in onym-discovery src/main.rs writes sig_path(&out)), but
+          # stage the output directory tolerantly anyway: naming the
+          # .sig explicitly would hard-fail the run POST-signing if a
+          # future pinned rev's output set differs, with the signed
+          # bytes already produced.
+          git add -A -- "$MANIFEST_SRC" manifest-signed/
           if git diff --cached --quiet; then
             echo 'Signed bytes are unchanged — nothing to commit.'
             echo "committed=false" >> "$GITHUB_OUTPUT"
@@ -244,7 +252,17 @@ jobs:
         with:
           token: ${{ secrets.DO_API_KEY }}
 
-      - name: Build and push image to DOCR
+      # Ordering: the spec update runs BEFORE the image push. Pushing
+      # the :current tag already triggers a deployment on its own
+      # (deploy_on_push), so updating the spec afterwards used to mint
+      # a SECOND deployment racing the first (and --update-sources
+      # forced yet another source pull) — with --wait attached to
+      # whichever the update happened to create while deploy_on_push
+      # superseded it. Spec first means --wait attaches to the spec
+      # deployment, and the single push afterwards triggers exactly one
+      # image deployment that App Platform sequences after it; the
+      # byte-verification step's retry loop absorbs its rollout.
+      - name: Set RELAYER_OPERATOR_MANIFEST in the app spec
         if: ${{ !inputs.skip_deploy }}
         env:
           DO_API_KEY: ${{ secrets.DO_API_KEY }}
@@ -255,21 +273,6 @@ jobs:
             echo 'from onym-infra instead.' >&2
             exit 1
           fi
-          registry="$(doctl registry get --format Name --no-header)"
-          if [ -z "$registry" ]; then
-            echo 'no DigitalOcean Container Registry found; deploy has never' >&2
-            echo 'run — run scripts/deploy-digitalocean.sh once first.' >&2
-            exit 1
-          fi
-          doctl registry login --expiry-seconds 3600
-          image="registry.digitalocean.com/$registry/$IMAGE_REPOSITORY:$IMAGE_TAG"
-          docker build --pull --platform linux/amd64 -t "$image" .
-          docker push "$image"
-          echo "Pushed $image (deploy_on_push will pick it up)."
-
-      - name: Set RELAYER_OPERATOR_MANIFEST and redeploy
-        if: ${{ !inputs.skip_deploy }}
-        run: |
           app_id="$(doctl apps list --format ID,Spec.Name --no-header \
             | awk -v name="$APP_NAME" '$2 == name { print $1; exit }')"
           if [ -z "$app_id" ]; then
@@ -304,12 +307,41 @@ jobs:
                 type: "GENERAL"
               }])
           ' "$RUNNER_TEMP/spec.json" > "$RUNNER_TEMP/spec.new.json"
-          doctl apps update "$app_id" \
+          # No --update-sources: this deployment exists to apply the env
+          # var; the fresh image arrives via the deploy_on_push
+          # deployment that the next step's push triggers. On the FIRST
+          # signing run this spec deployment can fail — it restarts the
+          # currently-pinned PRE-signing image with
+          # RELAYER_OPERATOR_MANIFEST set, and the relayer refuses to
+          # boot when the file is missing. The spec is stored
+          # regardless, and the image push right after converges the
+          # app (signed image + stored spec), so warn and continue; the
+          # byte verification below is the real gate.
+          if ! doctl apps update "$app_id" \
             --spec "$RUNNER_TEMP/spec.new.json" \
-            --update-sources \
             --format ID,DefaultIngress,Updated \
             --no-header \
-            --wait
+            --wait; then
+            echo '::warning::Spec deployment failed — expected on the first' \
+              'signing run (the previously pinned image predates' \
+              'manifest-signed/). The image push next converges the app;' \
+              'the byte verification step decides pass/fail.'
+          fi
+
+      - name: Build and push image to DOCR
+        if: ${{ !inputs.skip_deploy }}
+        run: |
+          registry="$(doctl registry get --format Name --no-header)"
+          if [ -z "$registry" ]; then
+            echo 'no DigitalOcean Container Registry found; deploy has never' >&2
+            echo 'run — run scripts/deploy-digitalocean.sh once first.' >&2
+            exit 1
+          fi
+          doctl registry login --expiry-seconds 3600
+          image="registry.digitalocean.com/$registry/$IMAGE_REPOSITORY:$IMAGE_TAG"
+          docker build --pull --platform linux/amd64 -t "$image" .
+          docker push "$image"
+          echo "Pushed $image (deploy_on_push deploys it against the updated spec)."
 
       - name: Verify served bytes
         env:

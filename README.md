@@ -221,9 +221,14 @@ The pieces:
   relayed transaction on that network fails). Confirm before signing:
 
   ```sh
-  stellar keys fund <G...> --network testnet   # testnet only (friendbot)
-  stellar balance --id <G...> --network testnet
-  stellar balance --id <G...> --network mainnet  # fund manually first
+  # Testnet: friendbot creates and funds the account (no-op error if
+  # it already exists — that is fine).
+  curl -sS "https://friendbot.stellar.org/?addr=<G...>"
+
+  # Both networks: Horizon returns the account record when it exists
+  # and is funded; HTTP 404 means NOT funded on that network.
+  curl -fsS "https://horizon-testnet.stellar.org/accounts/<G...>"
+  curl -fsS "https://horizon.stellar.org/accounts/<G...>"   # public — fund manually first
   ```
   `powers.setRestrictedMode: ["manifest-mirror"]` declares that the
   deployments the operator can restrict are exactly the ones in the
@@ -279,12 +284,29 @@ add required reviewers, and scope `RELAYER_OPERATOR_SEED` to that
 environment. Then every signing run waits for an approval before the
 seed is exposed to the job.
 
+Related caveat — **branch protection on `main`**: the workflow commits
+the signed bytes and pushes them to `main` with the default
+`GITHUB_TOKEN`. A branch-protection rule (or ruleset) on `main` that
+blocks direct pushes makes that push fail *after* signing has already
+happened — the run dies with the signed bytes stranded in the runner's
+workspace. If you protect `main`, either add a bypass for
+`github-actions[bot]` (rulesets support bypass actors) or expect to
+rework the commit step into a PR-based flow (open a PR with the signed
+bytes and gate the deploy/verify steps on its merge).
+
 ### Deploy paths
 
 - **App Platform** (default; `scripts/deploy-digitalocean.sh`
-  conventions, org-level `DO_API_KEY` secret): the workflow pushes a
-  fresh image to DOCR, ensures `RELAYER_OPERATOR_MANIFEST` in the app
-  spec, waits, and verifies strictly.
+  conventions, org-level `DO_API_KEY` secret): the workflow ensures
+  `RELAYER_OPERATOR_MANIFEST` in the app spec (waiting on that
+  deployment), then pushes a fresh image to DOCR — `deploy_on_push`
+  deploys it against the updated spec — and verifies strictly.
+  Ordinary redeploys stay safe afterwards:
+  `scripts/deploy-digitalocean.sh` regenerates the whole spec from the
+  env file, and it re-adds `RELAYER_OPERATOR_MANIFEST` on its own
+  whenever `manifest-signed/manifest.json` exists in the checkout, so
+  a routine deploy cannot silently drop the var and revert
+  `/manifest.json` to 404.
 - **onym-infra droplet** (where `relayer.onym.app` currently runs;
   the relayer is a git submodule of the compose stack): dispatch with
   `skip_deploy=true`, then follow these steps **in this order** —
