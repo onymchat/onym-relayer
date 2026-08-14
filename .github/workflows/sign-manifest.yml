@@ -116,6 +116,15 @@ jobs:
           # `git pull --rebase`, which needs more than a shallow clone.
           fetch-depth: 0
 
+      # Hard pre-signing gate, deliberately BEFORE anything touches the
+      # seed: signing publishes an immutable hash-pinned commitment, so
+      # a networks[] entry whose fee-payer does not exist on its
+      # network must block the signature, not surface after it. Same
+      # script as ci.yml's tripwire (warn-mode there), so the check
+      # cannot diverge.
+      - name: Fee-payer accounts must exist on their networks
+        run: scripts/check-manifest-funding.sh "$MANIFEST_SRC"
+
       - name: Validate RELAYER_OPERATOR_SEED
         env:
           RELAYER_OPERATOR_SEED: ${{ secrets.RELAYER_OPERATOR_SEED }}
@@ -255,8 +264,24 @@ jobs:
             -m 'Signed in CI by the sign-manifest workflow. manifest-signed/manifest.json
           is served byte-for-byte at GET /manifest.json; bindings pin its SHA-256.' \
             -m "Signer: onymchat/onym-discovery@$PINNED_SIGNER_REV (built from source at this pinned rev)"
-          git pull --rebase origin main
-          git push origin HEAD:main
+          # Retry the rebase+push a few times: main can move under this
+          # job (merges land while it runs), and losing the signed
+          # bytes to a push race after signing succeeded would leave
+          # the run red with nothing recoverable in the repo.
+          pushed=false
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              pushed=true
+              break
+            fi
+            echo "push attempt $attempt failed — retrying" >&2
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 5))
+          done
+          if [ "$pushed" != "true" ]; then
+            echo 'Could not push the signing commit to main after 3 attempts.' >&2
+            exit 1
+          fi
           echo "committed=true" >> "$GITHUB_OUTPUT"
 
       # Checked in its own step BEFORE digitalocean/action-doctl: with
@@ -292,9 +317,11 @@ jobs:
       # byte-verification step's retry loop absorbs its rollout.
       - name: Set RELAYER_OPERATOR_MANIFEST in the app spec
         if: ${{ !inputs.skip_deploy }}
+        id: spec
         run: |
           app_id="$(doctl apps list --format ID,Spec.Name --no-header \
             | awk -v name="$APP_NAME" '$2 == name { print $1; exit }')"
+          echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
           if [ -z "$app_id" ]; then
             echo "No App Platform app named '$APP_NAME'." >&2
             echo 'If this relayer is deployed from onym-infra (docker-compose' >&2
@@ -363,6 +390,38 @@ jobs:
           docker push "$image"
           echo "Pushed $image (deploy_on_push deploys it against the updated spec)."
 
+      # Wait for the push-triggered (deploy_on_push) deployment to
+      # reach ACTIVE before checking bytes: the byte loop should spend
+      # its budget on routing/cache convergence, not on the whole
+      # build+rollout, and a deployment that ERRORs should say so
+      # instead of surfacing as a mysterious byte mismatch.
+      - name: Wait for the image deployment to go ACTIVE
+        if: ${{ !inputs.skip_deploy }}
+        env:
+          APP_ID: ${{ steps.spec.outputs.app_id }}
+        run: |
+          # ~10 minutes; the deploy_on_push deployment can also take a
+          # moment to APPEAR after the push, which the same loop absorbs.
+          for _ in $(seq 1 60); do
+            phase="$(doctl apps list-deployments "$APP_ID" \
+              --format Phase --no-header | head -n1 || true)"
+            echo "Latest deployment phase: ${phase:-<none>}"
+            case "$phase" in
+              ACTIVE)
+                exit 0
+                ;;
+              ERROR|CANCELED)
+                echo "FAIL: latest deployment ended in $phase — the signed" >&2
+                echo 'bytes ARE committed and pushed; fix the deployment and' >&2
+                echo 're-run this workflow with skip_deploy=true to verify.' >&2
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+          echo '::warning::Deployment did not reach ACTIVE within the wait' \
+            'budget; proceeding to byte verification, which decides pass/fail.'
+
       - name: Verify served bytes
         env:
           SKIP_DEPLOY: ${{ inputs.skip_deploy }}
@@ -374,10 +433,13 @@ jobs:
               && sha256sum "$RUNNER_TEMP/fetched.json" | cut -d' ' -f1
           }
           got1=""
-          # The app can take a moment to route the new deployment. With
-          # skip_deploy nothing was redeployed, so a mismatch will not
-          # heal itself — keep that retry budget short.
-          attempts=30
+          # The deployment is ACTIVE by now (previous step), so this
+          # budget only has to cover routing/edge-cache convergence —
+          # but generously: a false FAIL here is alarming and the run
+          # cannot be partially retried (the commit already happened).
+          # With skip_deploy nothing was redeployed, so a mismatch will
+          # not heal itself — keep that retry budget short.
+          attempts=60
           if [ "$SKIP_DEPLOY" = "true" ]; then
             attempts=3
           fi
@@ -401,9 +463,24 @@ jobs:
               'in relayer.env, deploy, then re-run with skip_deploy=true.'
             exit 0
           fi
-          echo "FAIL: served bytes differ from the committed manifest." >&2
-          echo 'Bindings pin the SHA-256 of the committed bytes; a divergent' >&2
-          echo 'serving path breaks every client that pinned them.' >&2
+          # Two distinct failure shapes, distinct messages — the signed
+          # bytes are committed and pushed either way, so neither means
+          # the signing itself must be redone.
+          if [ -n "$got1" ] && [ "$got1" = "$got2" ]; then
+            echo "FAIL: served bytes differ from the committed manifest (stable" >&2
+            echo "mismatch: served $got1, committed $want). Bindings pin the" >&2
+            echo 'SHA-256 of the committed bytes; a divergent serving path breaks' >&2
+            echo 'every client that pinned them. Find what is serving the old' >&2
+            echo 'bytes (stale deployment? other deploy path?) before anything pins.' >&2
+            exit 1
+          fi
+          echo 'FAIL: bytes committed and pushed — verification TIMED OUT,' >&2
+          echo 'NOT necessarily divergence: the endpoint never settled on a' >&2
+          echo 'stable answer within the retry budget (slow rollout, transient' >&2
+          echo '5xx, cache churn). Re-run verification without re-signing:' >&2
+          echo 'dispatch this workflow again with skip_deploy=true (signing is' >&2
+          echo 'idempotent on unchanged src — it will find nothing to commit' >&2
+          echo 'and just check the served bytes).' >&2
           exit 1
 
       # Belt and braces: the commit step already deletes the seed on the

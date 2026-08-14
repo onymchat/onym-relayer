@@ -214,18 +214,38 @@ The pieces:
   (component id, declared powers, networks, offers, `validUntil`).
   Changing terms means editing this file and re-running the signing
   workflow: a new manifest version and hash, never an edit in place.
+  `validUntil` is enforced in three places: CI warns/fails while
+  there is still time to re-sign, the signing workflow refuses to
+  sign an already-expired src (via the boot-path verifier), and the
+  relayer itself **refuses to boot** on an expired manifest — the
+  last one matters because deploy paths like the onym-infra droplet
+  never pass through this repo's CI.
   The `networks[].submitterAccount` entries declare the fee-payer
-  account per network — the same `G...` account is used on both
-  testnet and public, and it must be funded **on both networks**
-  before clients pin the manifest (an unfunded fee-payer means every
-  relayed transaction on that network fails). Confirm before signing:
+  account per network, and each one must **exist (be funded) on its
+  network** before signing — an unfunded fee-payer means every
+  relayed transaction on that network fails, while the signed
+  manifest (whose hash clients pin, immutably) keeps promising it
+  works. `scripts/check-manifest-funding.sh` checks exactly this
+  against each network's Horizon; it runs as a hard pre-signing gate
+  in the sign-manifest workflow and as a CI tripwire (warn on PRs,
+  fail on pushes to `main` — accounts are funded, and can be emptied,
+  independently of any PR).
+
+  **v1 declares testnet only.** The mainnet (`public`) entry was
+  deliberately dropped: the fee-payer account is not funded on
+  mainnet yet, and signing would bake a nonexistent account into an
+  immutable commitment. Mainnet support rides a re-sign — once the
+  account is funded on mainnet, add the `public` entry back to this
+  file and dispatch sign-manifest: a new manifest version and hash
+  that clients pin fresh, which is safer than blocking today's
+  testnet dispatch on mainnet funding.
 
   ```sh
   # Testnet: friendbot creates and funds the account (no-op error if
   # it already exists — that is fine).
   curl -sS "https://friendbot.stellar.org/?addr=<G...>"
 
-  # Both networks: Horizon returns the account record when it exists
+  # Either network: Horizon returns the account record when it exists
   # and is funded; HTTP 404 means NOT funded on that network.
   curl -fsS "https://horizon-testnet.stellar.org/accounts/<G...>"
   curl -fsS "https://horizon.stellar.org/accounts/<G...>"   # public — fund manually first

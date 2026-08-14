@@ -2,40 +2,29 @@
 # Operator manifest expiry tripwire: fail while there is still time to
 # act. Clients REJECT expired manifests, so validUntil lapsing breaks
 # every pinned client at once — re-sign (dispatch sign-manifest with a
-# bumped validUntil in the src) well before the date.
+# bumped validUntil in the src) well before the date. The relayer
+# additionally refuses to BOOT on an expired manifest
+# (operator_manifest::load_and_verify), which covers deploy paths that
+# never pass through this CI, e.g. the onym-infra droplet.
 #
 # Shared by ci.yml and release.yml so the two checks cannot diverge.
 #
 # Usage: check-manifest-expiry.sh [--warn]
-#   --warn  report problems as a GitHub ::warning:: annotation and exit
-#           0. Used on pull_request runs: an expiring manifest is a
+#   --warn  see manifest-check-lib.sh (pull_request mode: expiry is a
 #           state of main, fixed by dispatching sign-manifest there —
-#           a PR author cannot fix it, so it must not gate their PR.
+#           a PR author cannot fix it, so it must not gate their PR).
 #
 # Needs GNU date (-d); CI runs on ubuntu-latest.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/manifest-check-lib.sh
 
-mode=fail
-if [ "${1:-}" = "--warn" ]; then
-  mode=warn
-  shift
-fi
+parse_mode_flag "$@"
+shift "$MODE_ARGS"
 if [ "$#" -ne 0 ]; then
   echo "usage: $0 [--warn]" >&2
   exit 2
 fi
-
-# Report a problem: hard failure by default, a single-line ::warning::
-# annotation (annotations cannot span lines) under --warn.
-problem() {
-  if [ "$mode" = warn ]; then
-    echo "::warning::$*"
-    exit 0
-  fi
-  printf 'FAIL: %s\n' "$*" >&2
-  exit 1
-}
 
 signed=manifest-signed/manifest.json
 if [ ! -f "$signed" ]; then
