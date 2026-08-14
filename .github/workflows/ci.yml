@@ -70,8 +70,13 @@ jobs:
           if [ "$src_norm" != "$signed_norm" ]; then
             echo "DRIFT: $src no longer matches $signed (canonical content)." >&2
             diff <(printf '%s\n' "$src_norm") <(printf '%s\n' "$signed_norm") >&2 || true
-            echo 're-dispatch sign-manifest: the src was edited after the last' >&2
-            echo 'signing run, so the served bytes still carry the old terms.' >&2
+            echo 'The src was edited after the last signing run, so the served' >&2
+            echo 'bytes still carry the old terms. If the edit was accidental,' >&2
+            echo 'revert it. If it was intentional (e.g. bumping validUntil),' >&2
+            echo 'this check stays red on the PR by design and goes green after' >&2
+            echo 'the signing commit lands: sign-manifest only runs on main, so' >&2
+            echo 'merge first, then dispatch it — the signed bytes it commits to' >&2
+            echo 'main are what re-align src and manifest-signed/.' >&2
             exit 1
           fi
           echo "OK: $src matches $signed modulo the signature."
