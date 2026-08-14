@@ -25,6 +25,11 @@ COPY --from=builder /build/target/release/onym-relayer /usr/local/bin/onym-relay
 # serve its exact committed bytes. Wire it up with
 #   RELAYER_OPERATOR_MANIFEST=/srv/operator-manifest/manifest.json
 # — unset, GET /manifest.json stays 404 and nothing else changes.
+# Belt and braces for the pre-first-signing case: the COPY of the
+# (possibly empty) builder directory was verified to create this
+# directory either way, but guarantee it exists so the image layout
+# never depends on BuildKit's empty-COPY behavior.
+RUN mkdir -p /srv/operator-manifest
 COPY --from=builder /build/manifest-signed/ /srv/operator-manifest/
 EXPOSE 8080
 CMD ["onym-relayer"]
