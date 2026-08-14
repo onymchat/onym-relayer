@@ -1,6 +1,7 @@
 mod config;
 mod handler;
 mod manifest;
+mod operator_manifest;
 mod validation;
 
 use std::net::SocketAddr;
@@ -9,7 +10,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -188,10 +189,29 @@ async fn main() {
         .parse()
         .expect("RELAYER_BIND must be a valid socket address");
 
+    // The signed notary-operator manifest, when this deployment
+    // publishes one. Boot fails on an invalid or mis-keyed manifest —
+    // serving bytes whose signature does not verify against their own
+    // operator key would poison every client that pins them.
+    let operator_manifest = match std::env::var("RELAYER_OPERATOR_MANIFEST") {
+        Err(_) => None,
+        Ok(path) => match operator_manifest::load_and_verify(std::path::Path::new(&path)) {
+            Ok(manifest) => {
+                eprintln!("Operator manifest: {path} ({})", manifest.operator);
+                Some(manifest)
+            }
+            Err(error) => {
+                eprintln!("Invalid operator manifest at {path}: {error}");
+                std::process::exit(1);
+            }
+        },
+    };
+
     let max_payload = config.max_payload_size;
     let state = Arc::new(AppState {
         rate_limiter: RateLimiter::new(config.rate_limit_per_minute),
         config,
+        operator_manifest,
     });
 
     // Spawn the periodic refresh once we have AppState in an Arc — both
@@ -209,6 +229,11 @@ async fn main() {
     let app = Router::new()
         .route("/", post(handler::handle_invoke))
         .route("/admin/refresh", post(handler::handle_admin_refresh))
+        .route("/manifest.json", get(handler::handle_operator_manifest))
+        .route(
+            "/manifest.json.sig",
+            get(handler::handle_operator_manifest_sig),
+        )
         .layer(RequestBodyLimitLayer::new(max_payload))
         .with_state(state)
         .into_make_service_with_connect_info::<SocketAddr>();
