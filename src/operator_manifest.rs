@@ -101,6 +101,30 @@ pub fn load_and_verify(path: &std::path::Path) -> Result<OperatorManifest, Strin
     })
 }
 
+/// [`load_and_verify`] plus, when a detached signature file is given,
+/// the agreement check the discovery spec calls for (§3 of the
+/// signing rule): the detached bytes must be the SAME signature the
+/// manifest embeds, whitespace aside. A disagreeing pair is refused
+/// even if each would verify on its own — tooling that verifies the
+/// detached form before parsing must see exactly what parsers see.
+pub fn verify_file(
+    path: &std::path::Path,
+    sig_path: Option<&std::path::Path>,
+) -> Result<OperatorManifest, String> {
+    let manifest = load_and_verify(path)?;
+    if let Some(sig_path) = sig_path {
+        let detached = std::fs::read_to_string(sig_path)
+            .map_err(|e| format!("read {}: {e}", sig_path.display()))?;
+        if detached.trim() != manifest.detached_signature {
+            return Err(format!(
+                "detached signature at {} does not match the embedded signature",
+                sig_path.display()
+            ));
+        }
+    }
+    Ok(manifest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +184,30 @@ mod tests {
         let err = load_and_verify(&path).unwrap_err();
         assert!(err.contains("does not verify"), "{err}");
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn agreeing_detached_signature_accepted() {
+        let bytes = signed_manifest("notary", false);
+        let path = write_temp("detached-ok", &bytes);
+        let embedded: Value = serde_json::from_slice(&bytes).unwrap();
+        let sig = embedded["signature"].as_str().unwrap();
+        // The signer CLI writes the base64 line with a trailing newline.
+        let sig_path = write_temp("detached-ok-sig", format!("{sig}\n").as_bytes());
+        verify_file(&path, Some(&sig_path)).unwrap();
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(sig_path).ok();
+    }
+
+    #[test]
+    fn disagreeing_detached_signature_refused() {
+        let bytes = signed_manifest("notary", false);
+        let path = write_temp("detached-bad", &bytes);
+        let sig_path = write_temp("detached-bad-sig", b"AAAA not the embedded signature\n");
+        let err = verify_file(&path, Some(&sig_path)).unwrap_err();
+        assert!(err.contains("does not match the embedded"), "{err}");
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(sig_path).ok();
     }
 
     #[test]

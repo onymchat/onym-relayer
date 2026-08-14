@@ -218,6 +218,19 @@ jobs:
             "$MANIFEST_SRC" --out "$MANIFEST_OUT"
           sha256sum "$MANIFEST_OUT"
 
+      # Validate the signer's output in the job that produced it, BEFORE
+      # anything is committed or deployed — with the relayer's own
+      # boot-path verifier (operator_manifest::verify_file), i.e. the
+      # exact code that will accept or refuse these bytes in production.
+      # It also checks the detached .sig agrees with the embedded
+      # signature. Deliberately NOT the pinned onym-discovery CLI: its
+      # `verify manifest` enforces the *discovery provider* schema
+      # (seat "discovery") and rejects this notary-seat manifest.
+      - name: Verify signed manifest with the boot-path verifier
+        run: |
+          cargo run --quiet -- verify-operator-manifest \
+            "$MANIFEST_OUT" "$MANIFEST_OUT.sig"
+
       - name: Commit signed bytes to main
         id: commit
         run: |
@@ -246,6 +259,21 @@ jobs:
           git push origin HEAD:main
           echo "committed=true" >> "$GITHUB_OUTPUT"
 
+      # Checked in its own step BEFORE digitalocean/action-doctl: with
+      # an empty token that action dies with an opaque auth error, and
+      # the operator never sees the skip_deploy hint.
+      - name: Require DO_API_KEY
+        if: ${{ !inputs.skip_deploy }}
+        env:
+          DO_API_KEY: ${{ secrets.DO_API_KEY }}
+        run: |
+          if [ -z "$DO_API_KEY" ]; then
+            echo 'DO_API_KEY is not set (org-level DigitalOcean token).' >&2
+            echo 'Either add it, or run with skip_deploy=true and deploy' >&2
+            echo 'from onym-infra instead.' >&2
+            exit 1
+          fi
+
       - name: Install doctl
         if: ${{ !inputs.skip_deploy }}
         uses: digitalocean/action-doctl@v2
@@ -264,15 +292,7 @@ jobs:
       # byte-verification step's retry loop absorbs its rollout.
       - name: Set RELAYER_OPERATOR_MANIFEST in the app spec
         if: ${{ !inputs.skip_deploy }}
-        env:
-          DO_API_KEY: ${{ secrets.DO_API_KEY }}
         run: |
-          if [ -z "$DO_API_KEY" ]; then
-            echo 'DO_API_KEY is not set (org-level DigitalOcean token).' >&2
-            echo 'Either add it, or run with skip_deploy=true and deploy' >&2
-            echo 'from onym-infra instead.' >&2
-            exit 1
-          fi
           app_id="$(doctl apps list --format ID,Spec.Name --no-header \
             | awk -v name="$APP_NAME" '$2 == name { print $1; exit }')"
           if [ -z "$app_id" ]; then

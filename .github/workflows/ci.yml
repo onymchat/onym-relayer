@@ -1,15 +1,17 @@
 name: CI
 
 # Runs on every PR and on pushes to main. Besides fmt + tests, this
-# carries two manifest tripwires that previously lived only in the
-# manually-dispatched release workflow — i.e. they never ran on PRs:
+# runs the two operator-manifest tripwires (scripts/check-manifest-*.sh,
+# shared with release.yml so the checks cannot diverge):
 #
 #   * drift check: operator-manifest.src.json edited without re-running
 #     the sign-manifest workflow means the served (signed) bytes
 #     silently keep the OLD terms;
 #   * validUntil check: an expiring signed manifest must be re-signed
 #     BEFORE expiry — clients reject expired manifests, so letting
-#     validUntil lapse breaks every pinned client at once.
+#     validUntil lapse breaks every pinned client at once. On PRs this
+#     only warns: expiry is a state of main that a PR author cannot
+#     fix, so it must not gate unrelated PRs.
 
 on:
   pull_request:
@@ -49,72 +51,18 @@ jobs:
       - name: Test
         run: cargo test
 
-      # Drift tripwire, NOT signature verification (the relayer verifies
-      # the signature against the operator key at boot; see
-      # operator_manifest::load_and_verify in src/main.rs). This only
-      # catches the cheap-to-catch failure mode: someone edits
-      # operator-manifest.src.json and forgets to re-run the
-      # sign-manifest workflow, so the served (signed) bytes silently
-      # keep the OLD terms. Compare canonical content — signature
-      # stripped, keys sorted — and fail loudly on mismatch.
+      # Shared with release.yml; see the script headers for what each
+      # tripwire catches (and what it deliberately does not).
       - name: Operator manifest drift check
-        run: |
-          signed=manifest-signed/manifest.json
-          src=operator-manifest.src.json
-          if [ ! -f "$signed" ]; then
-            echo "No $signed yet (manifest never signed) — skipping drift check."
-            exit 0
-          fi
-          src_norm="$(jq -S 'del(.signature)' "$src")"
-          signed_norm="$(jq -S 'del(.signature)' "$signed")"
-          if [ "$src_norm" != "$signed_norm" ]; then
-            echo "DRIFT: $src no longer matches $signed (canonical content)." >&2
-            diff <(printf '%s\n' "$src_norm") <(printf '%s\n' "$signed_norm") >&2 || true
-            echo 'The src was edited after the last signing run, so the served' >&2
-            echo 'bytes still carry the old terms. If the edit was accidental,' >&2
-            echo 'revert it. If it was intentional (e.g. bumping validUntil),' >&2
-            echo 'this check stays red on the PR by design and goes green after' >&2
-            echo 'the signing commit lands: sign-manifest only runs on main, so' >&2
-            echo 'merge first, then dispatch it — the signed bytes it commits to' >&2
-            echo 'main are what re-align src and manifest-signed/.' >&2
-            exit 1
-          fi
-          echo "OK: $src matches $signed modulo the signature."
+        run: scripts/check-manifest-drift.sh
 
-      # Expiry tripwire: fail while there is still time to act. Clients
-      # REJECT expired manifests, so validUntil lapsing breaks every
-      # pinned client at once — re-sign (dispatch sign-manifest with a
-      # bumped validUntil in the src) well before the date.
+      # Warn-only on PRs (an expiring manifest is fixed by dispatching
+      # sign-manifest on main, not by any PR); hard fail on push to
+      # main, where the people who can act see it.
       - name: Operator manifest validUntil check
         run: |
-          signed=manifest-signed/manifest.json
-          if [ ! -f "$signed" ]; then
-            echo "No $signed yet (manifest never signed) — skipping validUntil check."
-            exit 0
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            scripts/check-manifest-expiry.sh --warn
+          else
+            scripts/check-manifest-expiry.sh
           fi
-          valid_until="$(jq -r '.validUntil // empty' "$signed")"
-          if [ -z "$valid_until" ]; then
-            echo "FAIL: $signed has no validUntil field." >&2
-            exit 1
-          fi
-          until_s="$(date -u -d "$valid_until" +%s)" || {
-            echo "FAIL: cannot parse validUntil '$valid_until'." >&2
-            exit 1
-          }
-          now_s="$(date -u +%s)"
-          thirty_days=$((30 * 24 * 60 * 60))
-          if [ "$until_s" -le "$now_s" ]; then
-            echo "FAIL: signed manifest EXPIRED at $valid_until." >&2
-            echo 'Clients reject expired manifests — every pinned client is' >&2
-            echo 'broken. Bump validUntil in operator-manifest.src.json and' >&2
-            echo 'dispatch sign-manifest immediately.' >&2
-            exit 1
-          fi
-          if [ $((until_s - now_s)) -lt "$thirty_days" ]; then
-            echo "FAIL: signed manifest validUntil ($valid_until) is within" >&2
-            echo '30 days. Re-sign BEFORE expiry: bump validUntil in' >&2
-            echo 'operator-manifest.src.json and dispatch sign-manifest —' >&2
-            echo 'clients reject expired manifests.' >&2
-            exit 1
-          fi
-          echo "OK: validUntil $valid_until is more than 30 days out."

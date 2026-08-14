@@ -31,40 +31,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Test
         run: |
           cargo fmt --check
           cargo test
 
-      # Drift tripwire, NOT signature verification (the relayer verifies
-      # the signature against the operator key at boot; see
-      # operator_manifest::load_and_verify in src/main.rs). This only
-      # catches the cheap-to-catch failure mode: someone edits
-      # operator-manifest.src.json and forgets to re-run the sign-manifest
-      # workflow, so the served (signed) bytes silently keep the OLD
-      # terms. Compare canonical content — signature stripped, keys
-      # sorted — and fail loudly on mismatch.
+      # Shared with ci.yml so the tripwires cannot diverge; see the
+      # script headers. A release is cut by someone who can dispatch
+      # sign-manifest, so the expiry check hard-fails here.
       - name: Operator manifest drift check
-        run: |
-          signed=manifest-signed/manifest.json
-          src=operator-manifest.src.json
-          if [ ! -f "$signed" ]; then
-            echo "No $signed yet (manifest never signed) — skipping drift check."
-            exit 0
-          fi
-          src_norm="$(jq -S 'del(.signature)' "$src")"
-          signed_norm="$(jq -S 'del(.signature)' "$signed")"
-          if [ "$src_norm" != "$signed_norm" ]; then
-            echo "DRIFT: $src no longer matches $signed (canonical content)." >&2
-            diff <(printf '%s\n' "$src_norm") <(printf '%s\n' "$signed_norm") >&2 || true
-            echo 're-dispatch sign-manifest: the src was edited after the last' >&2
-            echo 'signing run, so the served bytes still carry the old terms.' >&2
-            exit 1
-          fi
-          echo "OK: $src matches $signed modulo the signature."
+        run: scripts/check-manifest-drift.sh
+
+      - name: Operator manifest validUntil check
+        run: scripts/check-manifest-expiry.sh
 
       - name: Validate manifests
         run: |
