@@ -1,0 +1,356 @@
+name: Sign operator manifest
+
+# Signs the notary-operator manifest (operator-manifest.src.json) in CI
+# with the RELAYER_OPERATOR_SEED secret, commits the signed bytes to
+# main under manifest-signed/ (so the bytes the service serves are
+# auditable in-repo), redeploys, and verifies that
+# https://relayer.onym.app/manifest.json serves EXACTLY the committed
+# bytes. Group bindings and entitlements pin the SHA-256 of these bytes
+# (onym-system/notary/UI-Notary-BNB.md §8.1), which is why the workflow
+# is byte-paranoid end to end.
+#
+# The signed file reaches the container through the image: the
+# Dockerfile copies manifest-signed/ to /srv/operator-manifest/, and
+# RELAYER_OPERATOR_MANIFEST points the service at it. Because the image
+# is built from the repo, this run MUST be dispatched on main and it
+# commits to main directly — a signed manifest on a side branch would
+# never reach a deployed image.
+#
+# Deploy paths:
+#   * DigitalOcean App Platform (scripts/deploy-digitalocean.sh
+#     conventions: app "onym-relayer", service "relayer", DOCR image
+#     onym-relayer:current with deploy_on_push): the default. Requires
+#     the org-level DO_API_KEY secret; the workflow pushes a fresh
+#     image, sets RELAYER_OPERATOR_MANIFEST in the app spec, waits, and
+#     verifies strictly.
+#   * onym-infra droplet (docker-compose; the relayer is a git
+#     submodule there): run with skip_deploy=true, then bump the
+#     relayer submodule in onym-infra, add
+#     RELAYER_OPERATOR_MANIFEST=/srv/operator-manifest/manifest.json to
+#     relayer.env, and deploy onym-infra. Byte verification then only
+#     warns (the droplet has not picked the commit up yet); re-run with
+#     skip_deploy=true after the infra deploy for a green byte check.
+#
+# Secrets:
+#   RELAYER_OPERATOR_SEED  64 hex chars (see README "Operator manifest
+#                          signing" for generation and custody)
+#   DO_API_KEY             org-level DigitalOcean token (only when
+#                          deploying via App Platform)
+#
+# First run vs later runs: the committed src ships with
+# operator "onym:key:REPLACE-OPERATOR-KEY"; the first run substitutes
+# the key derived from the seed and commits the resolved src alongside
+# the signed bytes. Every later run verifies that the committed operator
+# key still matches the seed and fails on mismatch (a mismatch means
+# the secret changed under a published manifest — that is a different
+# operator, not a rotation; see the README).
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "sign-and-deploy" to confirm signing and publishing the operator manifest'
+        required: true
+        type: string
+      skip_deploy:
+        description: 'Sign, commit, and verify only — skip the App Platform redeploy (use this when the relayer is deployed from onym-infra; the byte check then warns instead of failing)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+# Two runs racing would both sign and race the push to main; serialize.
+concurrency:
+  group: sign-manifest
+  cancel-in-progress: false
+
+env:
+  MANIFEST_SRC: operator-manifest.src.json
+  MANIFEST_OUT: manifest-signed/manifest.json
+  MANIFEST_URL: https://relayer.onym.app/manifest.json
+  MANIFEST_CONTAINER_PATH: /srv/operator-manifest/manifest.json
+  APP_NAME: onym-relayer
+  SERVICE_NAME: relayer
+  IMAGE_REPOSITORY: onym-relayer
+  IMAGE_TAG: current
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    # Gate the signing seed behind the "production" environment.
+    # CAUTION: GitHub AUTO-CREATES this environment, UNPROTECTED, on the
+    # first dispatch — merely naming it here provides no approval gate.
+    # The gate exists only after an operator adds required reviewers to
+    # the environment in repo Settings, which must happen BEFORE the
+    # first dispatch. See README "Operator manifest signing".
+    environment: production
+    steps:
+      - name: Require confirmation and main
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$CONFIRM" != "sign-and-deploy" ]; then
+            echo 'Refusing: type "sign-and-deploy" in the confirm input.' >&2
+            exit 1
+          fi
+          if [ "$REF_NAME" != "main" ]; then
+            echo "Refusing: dispatched on '$REF_NAME'. The signed manifest must be" >&2
+            echo 'committed to main — images are built from main — so this workflow' >&2
+            echo 'only runs there. Dispatch it with the main branch selected.' >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate RELAYER_OPERATOR_SEED
+        env:
+          RELAYER_OPERATOR_SEED: ${{ secrets.RELAYER_OPERATOR_SEED }}
+        run: |
+          if [ -z "$RELAYER_OPERATOR_SEED" ]; then
+            cat >&2 <<'EOF'
+          RELAYER_OPERATOR_SEED is not set. Generate the operator seed OFFLINE:
+
+            cargo install --git https://github.com/onymchat/onym-discovery --locked
+            onym-discovery keygen --out relayer-operator.seed
+
+          Then:
+            - secret value = the file's contents (64 hex characters);
+            - keep relayer-operator.seed offline as the custody copy;
+            - publish the printed fingerprint out of band;
+            - add the secret under repo Settings -> Secrets -> Actions
+              (scope it to the "production" environment once that
+              environment has required reviewers).
+
+          There is no rotation in v1: a lost or replaced key is a NEW
+          operator and clients must re-pin. See README "Operator
+          manifest signing".
+          EOF
+            exit 1
+          fi
+          seed="$(printf '%s' "$RELAYER_OPERATOR_SEED" | tr -d '[:space:]')"
+          if ! printf '%s' "$seed" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+            echo 'RELAYER_OPERATOR_SEED must be exactly 64 hex characters' >&2
+            echo '(the whole value, no prefix, whitespace ignored).' >&2
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$seed" > "$RUNNER_TEMP/operator.seed"
+
+      - name: Resolve onym-discovery CLI revision
+        id: cli-rev
+        run: |
+          rev="$(git ls-remote https://github.com/onymchat/onym-discovery.git refs/heads/main | cut -f1)"
+          if [ -z "$rev" ]; then
+            echo 'could not resolve onymchat/onym-discovery main' >&2
+            exit 1
+          fi
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - name: Cache onym-discovery CLI
+        id: cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/onym-discovery
+          key: onym-discovery-cli-${{ runner.os }}-${{ steps.cli-rev.outputs.rev }}
+
+      - name: Install Rust
+        if: steps.cli-cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install onym-discovery CLI
+        if: steps.cli-cache.outputs.cache-hit != 'true'
+        env:
+          CLI_REV: ${{ steps.cli-rev.outputs.rev }}
+        run: |
+          cargo install --git https://github.com/onymchat/onym-discovery \
+            --rev "$CLI_REV" --locked
+
+      - name: Derive operator identity
+        id: identity
+        run: |
+          out="$("$HOME/.cargo/bin/onym-discovery" fingerprint --seed "$RUNNER_TEMP/operator.seed")"
+          operator="$(printf '%s\n' "$out" | awk '$1 == "operator:" { print $2 }')"
+          fingerprint="$(printf '%s\n' "$out" | awk '$1 == "fingerprint:" { print $2 }')"
+          case "$operator" in
+            onym:key:*) ;;
+            *) echo "unexpected fingerprint output: $out" >&2; exit 1 ;;
+          esac
+          echo "operator=$operator" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          echo "Operator id: $operator"
+          echo "Fingerprint: $fingerprint"
+
+      - name: Resolve operator key in manifest source
+        env:
+          OPERATOR: ${{ steps.identity.outputs.operator }}
+        run: |
+          committed="$(jq -r '.operator' "$MANIFEST_SRC")"
+          if [ "$committed" = "onym:key:REPLACE-OPERATOR-KEY" ]; then
+            echo "First run: substituting operator key into $MANIFEST_SRC"
+            jq --arg op "$OPERATOR" '.operator = $op' "$MANIFEST_SRC" > "$MANIFEST_SRC.tmp"
+            mv "$MANIFEST_SRC.tmp" "$MANIFEST_SRC"
+          elif [ "$committed" != "$OPERATOR" ]; then
+            echo "Operator key mismatch:" >&2
+            echo "  committed in $MANIFEST_SRC: $committed" >&2
+            echo "  derived from RELAYER_OPERATOR_SEED: $OPERATOR" >&2
+            echo 'The secret does not correspond to the published operator.' >&2
+            echo 'A key change is a NEW operator (clients re-pin), never an' >&2
+            echo 'edit — fix the secret, or knowingly update the src first.' >&2
+            exit 1
+          fi
+
+      - name: Sign manifest
+        run: |
+          mkdir -p "$(dirname "$MANIFEST_OUT")"
+          "$HOME/.cargo/bin/onym-discovery" sign-manifest \
+            --seed "$RUNNER_TEMP/operator.seed" \
+            "$MANIFEST_SRC" --out "$MANIFEST_OUT"
+          sha256sum "$MANIFEST_OUT"
+
+      - name: Commit signed bytes to main
+        id: commit
+        run: |
+          rm -f "$RUNNER_TEMP/operator.seed"
+          git add "$MANIFEST_SRC" "$MANIFEST_OUT" "$MANIFEST_OUT.sig"
+          if git diff --cached --quiet; then
+            echo 'Signed bytes are unchanged — nothing to commit.'
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Sign the notary-operator manifest
+
+          Signed in CI by the sign-manifest workflow. manifest-signed/manifest.json
+          is served byte-for-byte at GET /manifest.json; bindings pin its SHA-256.'
+          git pull --rebase origin main
+          git push origin HEAD:main
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install doctl
+        if: ${{ !inputs.skip_deploy }}
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_API_KEY }}
+
+      - name: Build and push image to DOCR
+        if: ${{ !inputs.skip_deploy }}
+        env:
+          DO_API_KEY: ${{ secrets.DO_API_KEY }}
+        run: |
+          if [ -z "$DO_API_KEY" ]; then
+            echo 'DO_API_KEY is not set (org-level DigitalOcean token).' >&2
+            echo 'Either add it, or run with skip_deploy=true and deploy' >&2
+            echo 'from onym-infra instead.' >&2
+            exit 1
+          fi
+          registry="$(doctl registry get --format Name --no-header)"
+          if [ -z "$registry" ]; then
+            echo 'no DigitalOcean Container Registry found; deploy has never' >&2
+            echo 'run — run scripts/deploy-digitalocean.sh once first.' >&2
+            exit 1
+          fi
+          doctl registry login --expiry-seconds 3600
+          image="registry.digitalocean.com/$registry/$IMAGE_REPOSITORY:$IMAGE_TAG"
+          docker build --pull --platform linux/amd64 -t "$image" .
+          docker push "$image"
+          echo "Pushed $image (deploy_on_push will pick it up)."
+
+      - name: Set RELAYER_OPERATOR_MANIFEST and redeploy
+        if: ${{ !inputs.skip_deploy }}
+        run: |
+          app_id="$(doctl apps list --format ID,Spec.Name --no-header \
+            | awk -v name="$APP_NAME" '$2 == name { print $1; exit }')"
+          if [ -z "$app_id" ]; then
+            echo "No App Platform app named '$APP_NAME'." >&2
+            echo 'If this relayer is deployed from onym-infra (docker-compose' >&2
+            echo 'droplet), run this workflow with skip_deploy=true, bump the' >&2
+            echo 'relayer submodule in onym-infra, set' >&2
+            echo "RELAYER_OPERATOR_MANIFEST=$MANIFEST_CONTAINER_PATH in" >&2
+            echo 'relayer.env, and deploy onym-infra.' >&2
+            exit 1
+          fi
+          doctl apps get "$app_id" --output json | jq '.[0].spec' > "$RUNNER_TEMP/spec.json"
+          jq --arg svc "$SERVICE_NAME" --arg path "$MANIFEST_CONTAINER_PATH" '
+            (.services[] | select(.name == $svc) | .envs) |=
+              ((. // []) | map(select(.key != "RELAYER_OPERATOR_MANIFEST")) + [{
+                key: "RELAYER_OPERATOR_MANIFEST",
+                value: $path,
+                scope: "RUN_TIME",
+                type: "GENERAL"
+              }])
+          ' "$RUNNER_TEMP/spec.json" > "$RUNNER_TEMP/spec.new.json"
+          doctl apps update "$app_id" \
+            --spec "$RUNNER_TEMP/spec.new.json" \
+            --update-sources \
+            --format ID,DefaultIngress,Updated \
+            --no-header \
+            --wait
+
+      - name: Verify served bytes
+        env:
+          SKIP_DEPLOY: ${{ inputs.skip_deploy }}
+        run: |
+          want="$(sha256sum "$MANIFEST_OUT" | cut -d' ' -f1)"
+          echo "Committed sha256: $want"
+          fetch_sha() {
+            curl -fsS "$MANIFEST_URL" -o "$RUNNER_TEMP/fetched.json" \
+              && sha256sum "$RUNNER_TEMP/fetched.json" | cut -d' ' -f1
+          }
+          got1=""
+          # The app can take a moment to route the new deployment.
+          for _ in $(seq 1 30); do
+            got1="$(fetch_sha || true)"
+            [ "$got1" = "$want" ] && break
+            sleep 10
+          done
+          got2="$(fetch_sha || true)"
+          echo "Fetched sha256 (1st): ${got1:-<fetch failed>}"
+          echo "Fetched sha256 (2nd): ${got2:-<fetch failed>}"
+          if [ "$got1" = "$want" ] && [ "$got2" = "$want" ]; then
+            echo "OK: $MANIFEST_URL serves the committed bytes, stably."
+            exit 0
+          fi
+          if [ "$SKIP_DEPLOY" = "true" ]; then
+            echo "::warning::$MANIFEST_URL does not (yet) serve the committed bytes." \
+              'Expected while the onym-infra deployment has not picked up this' \
+              'commit — bump the relayer submodule, set RELAYER_OPERATOR_MANIFEST' \
+              'in relayer.env, deploy, then re-run with skip_deploy=true.'
+            exit 0
+          fi
+          echo "FAIL: served bytes differ from the committed manifest." >&2
+          echo 'Bindings pin the SHA-256 of the committed bytes; a divergent' >&2
+          echo 'serving path breaks every client that pinned them.' >&2
+          exit 1
+
+      - name: Job summary
+        if: always()
+        env:
+          OPERATOR: ${{ steps.identity.outputs.operator }}
+          FINGERPRINT: ${{ steps.identity.outputs.fingerprint }}
+          COMMITTED: ${{ steps.commit.outputs.committed }}
+        run: |
+          digest=""
+          if [ -f "$MANIFEST_OUT" ]; then
+            digest="$(sha256sum "$MANIFEST_OUT" | cut -d' ' -f1)"
+          fi
+          {
+            echo '## Notary operator identity'
+            echo
+            echo 'Publish these OUT OF BAND (site, repo README, announcement) so'
+            echo 'clients can check what they pin:'
+            echo
+            echo "- **Operator id**: \`${OPERATOR:-<not derived>}\`"
+            echo "- **Fingerprint**: \`${FINGERPRINT:-<not derived>}\`"
+            echo "- **Manifest sha256**: \`${digest:-<not signed>}\`"
+            echo "- New signing commit pushed: ${COMMITTED:-false}"
+            echo
+            echo 'The Discovery catalog pins this operator id: replace'
+            echo '`onym:key:REPLACE-RELAYER-KEY` in onym-discovery'
+            echo '`deploy/onym/catalogs/onym-services.config.json` with the'
+            echo 'operator id above.'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -201,6 +201,85 @@ The apps seed a hardcoded default at first launch (offline-proof), then refresh
 from these manifests in the background; a user's own custom entries are never
 overwritten, and "Restore default" re-fetches the published list.
 
+## Operator manifest signing (notary seat)
+
+The relayer is a declared notary-seat operator
+(`onym-system/notary/UI-Notary-BNB.md` §8): it serves a signed
+operator manifest byte-for-byte at `GET /manifest.json`, and group
+bindings and entitlements pin the SHA-256 of exactly those bytes.
+
+The pieces:
+
+- `operator-manifest.src.json` — the unsigned manifest source
+  (component id, declared powers, networks, offers, `validUntil`).
+  Changing terms means editing this file and re-running the signing
+  workflow: a new manifest version and hash, never an edit in place.
+  `powers.setRestrictedMode: ["manifest-mirror"]` declares that the
+  deployments the operator can restrict are exactly the ones in the
+  contracts manifest it mirrors (same semantics as
+  `allowlistControl`), instead of enumerating contract IDs that churn
+  with every contracts release.
+- `manifest-signed/manifest.json` (+ `.sig`) — the signed bytes,
+  committed to `main` by the workflow so what the service serves is
+  auditable in-repo. The Dockerfile copies `manifest-signed/` to
+  `/srv/operator-manifest/` inside the image;
+  `RELAYER_OPERATOR_MANIFEST=/srv/operator-manifest/manifest.json`
+  wires the service to it.
+- `.github/workflows/sign-manifest.yml` — manual dispatch (type
+  `sign-and-deploy` in the confirm input, on `main`): installs the
+  `onym-discovery` CLI, signs with the `RELAYER_OPERATOR_SEED` secret,
+  commits the signed bytes to `main`, redeploys, and verifies that
+  `https://relayer.onym.app/manifest.json` serves the committed bytes
+  stably (two fetches, both SHA-256-equal to the committed file). The
+  operator id and fingerprint are printed in the job summary for
+  out-of-band publication — and must also be copied over
+  `REPLACE-RELAYER-KEY` in onym-discovery's
+  `deploy/onym/catalogs/onym-services.config.json`, which is what the
+  Discovery catalog pins.
+
+### The `RELAYER_OPERATOR_SEED` secret
+
+Generate the seed **offline**, not in CI:
+
+```sh
+cargo install --git https://github.com/onymchat/onym-discovery --locked
+onym-discovery keygen --out relayer-operator.seed
+```
+
+- The secret value is the file's contents: 64 hex characters.
+- Keep `relayer-operator.seed` offline as the custody copy.
+- Publish the printed fingerprint out of band (site, announcement) so
+  clients can check what they pin.
+- **No rotation in v1.** A lost or replaced key is a *new* operator:
+  existing bindings keep verifying against the old manifest bytes
+  forever, but clients must re-pin to trust anything new. The workflow
+  enforces this by failing when the seed no longer matches the
+  operator key committed in `operator-manifest.src.json`.
+
+### Environment protection (recommended)
+
+The workflow runs in the `production` environment. GitHub
+auto-creates that environment **unprotected** on first dispatch, so
+before the first run: repo Settings → Environments → `production` →
+add required reviewers, and scope `RELAYER_OPERATOR_SEED` to that
+environment. Then every signing run waits for an approval before the
+seed is exposed to the job.
+
+### Deploy paths
+
+- **App Platform** (default; `scripts/deploy-digitalocean.sh`
+  conventions, org-level `DO_API_KEY` secret): the workflow pushes a
+  fresh image to DOCR, ensures `RELAYER_OPERATOR_MANIFEST` in the app
+  spec, waits, and verifies strictly.
+- **onym-infra droplet** (where `relayer.onym.app` currently runs;
+  the relayer is a git submodule of the compose stack): dispatch with
+  `skip_deploy=true`, then in onym-infra bump the `relayer` submodule
+  to the signing commit, set
+  `RELAYER_OPERATOR_MANIFEST=/srv/operator-manifest/manifest.json` in
+  `relayer.env`, and deploy. The byte check warns instead of failing
+  until the droplet serves the new bytes; re-run with
+  `skip_deploy=true` afterwards for a green verification.
+
 ## API
 
 The service accepts `POST /` requests with:
