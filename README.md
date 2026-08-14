@@ -214,6 +214,17 @@ The pieces:
   (component id, declared powers, networks, offers, `validUntil`).
   Changing terms means editing this file and re-running the signing
   workflow: a new manifest version and hash, never an edit in place.
+  The `networks[].submitterAccount` entries declare the fee-payer
+  account per network — the same `G...` account is used on both
+  testnet and public, and it must be funded **on both networks**
+  before clients pin the manifest (an unfunded fee-payer means every
+  relayed transaction on that network fails). Confirm before signing:
+
+  ```sh
+  stellar keys fund <G...> --network testnet   # testnet only (friendbot)
+  stellar balance --id <G...> --network testnet
+  stellar balance --id <G...> --network mainnet  # fund manually first
+  ```
   `powers.setRestrictedMode: ["manifest-mirror"]` declares that the
   deployments the operator can restrict are exactly the ones in the
   contracts manifest it mirrors (same semantics as
@@ -226,8 +237,11 @@ The pieces:
   `RELAYER_OPERATOR_MANIFEST=/srv/operator-manifest/manifest.json`
   wires the service to it.
 - `.github/workflows/sign-manifest.yml` — manual dispatch (type
-  `sign-and-deploy` in the confirm input, on `main`): installs the
-  `onym-discovery` CLI, signs with the `RELAYER_OPERATOR_SEED` secret,
+  `sign-and-deploy` in the confirm input, on `main`): builds the
+  `onym-discovery` CLI from source at a pinned revision
+  (`PINNED_SIGNER_REV` in the workflow — never a floating branch, and
+  never a cached binary, since the job holds the signing seed),
+  signs with the `RELAYER_OPERATOR_SEED` secret,
   commits the signed bytes to `main`, redeploys, and verifies that
   `https://relayer.onym.app/manifest.json` serves the committed bytes
   stably (two fetches, both SHA-256-equal to the committed file). The
@@ -273,12 +287,27 @@ seed is exposed to the job.
   spec, waits, and verifies strictly.
 - **onym-infra droplet** (where `relayer.onym.app` currently runs;
   the relayer is a git submodule of the compose stack): dispatch with
-  `skip_deploy=true`, then in onym-infra bump the `relayer` submodule
-  to the signing commit, set
-  `RELAYER_OPERATOR_MANIFEST=/srv/operator-manifest/manifest.json` in
-  `relayer.env`, and deploy. The byte check warns instead of failing
-  until the droplet serves the new bytes; re-run with
-  `skip_deploy=true` afterwards for a green verification.
+  `skip_deploy=true`, then follow these steps **in this order** —
+  the order matters, because the relayer exits at boot
+  (`std::process::exit(1)` in `src/main.rs`) when
+  `RELAYER_OPERATOR_MANIFEST` points at a file that does not exist or
+  does not verify. Setting the env var before the image contains
+  `manifest-signed/manifest.json` puts the container in a crash loop.
+
+  1. Dispatch `sign-manifest` with `skip_deploy=true`; it commits the
+     signed bytes to `main` (the byte check will only *warn* — the
+     droplet has not picked the commit up yet).
+  2. **First**, in onym-infra: bump the `relayer` submodule to that
+     signing commit (so the image built from it actually contains
+     `/srv/operator-manifest/manifest.json`).
+  3. **Only then** set
+     `RELAYER_OPERATOR_MANIFEST=/srv/operator-manifest/manifest.json`
+     in `relayer.env`. Do these two in one onym-infra commit if you
+     like — what must never happen is deploying the env var against
+     an image built from a pre-signing submodule rev.
+  4. Deploy onym-infra.
+  5. Re-run `sign-manifest` with `skip_deploy=true` for a green
+     byte-for-byte verification of the served manifest.
 
 ## API
 

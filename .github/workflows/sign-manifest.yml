@@ -67,6 +67,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # Exact onymchat/onym-discovery revision the signer CLI is built from.
+  # Pinned on purpose: this job holds RELAYER_OPERATOR_SEED, so the
+  # signer must be reviewed-and-frozen source, never floating main.
+  # Bump deliberately (review the diff in onym-discovery first).
+  PINNED_SIGNER_REV: b722c27f459200dd5f0176d96d073b6622ce5cdf
   MANIFEST_SRC: operator-manifest.src.json
   MANIFEST_OUT: manifest-signed/manifest.json
   MANIFEST_URL: https://relayer.onym.app/manifest.json
@@ -105,6 +110,10 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history: the commit step recovers from push races with
+          # `git pull --rebase`, which needs more than a shallow clone.
+          fetch-depth: 0
 
       - name: Validate RELAYER_OPERATOR_SEED
         env:
@@ -140,34 +149,31 @@ jobs:
           umask 077
           printf '%s\n' "$seed" > "$RUNNER_TEMP/operator.seed"
 
-      - name: Resolve onym-discovery CLI revision
-        id: cli-rev
-        run: |
-          rev="$(git ls-remote https://github.com/onymchat/onym-discovery.git refs/heads/main | cut -f1)"
-          if [ -z "$rev" ]; then
-            echo 'could not resolve onymchat/onym-discovery main' >&2
-            exit 1
-          fi
-          echo "rev=$rev" >> "$GITHUB_OUTPUT"
-
-      - name: Cache onym-discovery CLI
-        id: cli-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/onym-discovery
-          key: onym-discovery-cli-${{ runner.os }}-${{ steps.cli-rev.outputs.rev }}
-
+      # Supply chain: the signer is built FROM SOURCE at the pinned
+      # revision, inside this seed-bearing job, every run. Deliberately
+      # NO cross-run cache of the compiled binary: Actions caches are
+      # writable from any branch of this repo, so a cached executable
+      # restored next to RELAYER_OPERATOR_SEED would be a
+      # seed-exfiltration path. Caching cargo's registry/git *sources*
+      # below is fine — they are checksum-verified against the pinned
+      # rev's Cargo.lock at build time.
       - name: Install Rust
-        if: steps.cli-cache.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install onym-discovery CLI
-        if: steps.cli-cache.outputs.cache-hit != 'true'
-        env:
-          CLI_REV: ${{ steps.cli-rev.outputs.rev }}
+      - name: Cache cargo registry (sources only, never binaries)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-src-${{ runner.os }}-signer-${{ env.PINNED_SIGNER_REV }}
+
+      - name: Build onym-discovery CLI from source at pinned rev
         run: |
           cargo install --git https://github.com/onymchat/onym-discovery \
-            --rev "$CLI_REV" --locked
+            --rev "$PINNED_SIGNER_REV" --locked --force
+          echo "Signer built from onymchat/onym-discovery@$PINNED_SIGNER_REV"
 
       - name: Derive operator identity
         id: identity
@@ -223,10 +229,11 @@ jobs:
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'Sign the notary-operator manifest
-
-          Signed in CI by the sign-manifest workflow. manifest-signed/manifest.json
-          is served byte-for-byte at GET /manifest.json; bindings pin its SHA-256.'
+          git commit \
+            -m 'Sign the notary-operator manifest' \
+            -m 'Signed in CI by the sign-manifest workflow. manifest-signed/manifest.json
+          is served byte-for-byte at GET /manifest.json; bindings pin its SHA-256.' \
+            -m "Signer: onymchat/onym-discovery@$PINNED_SIGNER_REV (built from source at this pinned rev)"
           git pull --rebase origin main
           git push origin HEAD:main
           echo "committed=true" >> "$GITHUB_OUTPUT"
@@ -275,6 +282,19 @@ jobs:
             exit 1
           fi
           doctl apps get "$app_id" --output json | jq '.[0].spec' > "$RUNNER_TEMP/spec.json"
+          # The env upsert below selects by service name; if the name did
+          # not match it would be a SILENT no-op and the app would deploy
+          # without RELAYER_OPERATOR_MANIFEST. Assert the service exists.
+          if ! jq -e --arg svc "$SERVICE_NAME" \
+              '.services[]? | select(.name == $svc)' \
+              "$RUNNER_TEMP/spec.json" > /dev/null; then
+            echo "No service named '$SERVICE_NAME' in the app spec of '$APP_NAME'." >&2
+            echo 'Services present:' >&2
+            jq -r '[.services[]?.name] | join(", ")' "$RUNNER_TEMP/spec.json" >&2
+            echo 'Fix SERVICE_NAME in this workflow (or the app spec) —' >&2
+            echo 'otherwise the env upsert silently does nothing.' >&2
+            exit 1
+          fi
           jq --arg svc "$SERVICE_NAME" --arg path "$MANIFEST_CONTAINER_PATH" '
             (.services[] | select(.name == $svc) | .envs) |=
               ((. // []) | map(select(.key != "RELAYER_OPERATOR_MANIFEST")) + [{
@@ -302,11 +322,18 @@ jobs:
               && sha256sum "$RUNNER_TEMP/fetched.json" | cut -d' ' -f1
           }
           got1=""
-          # The app can take a moment to route the new deployment.
-          for _ in $(seq 1 30); do
+          # The app can take a moment to route the new deployment. With
+          # skip_deploy nothing was redeployed, so a mismatch will not
+          # heal itself — keep that retry budget short.
+          attempts=30
+          if [ "$SKIP_DEPLOY" = "true" ]; then
+            attempts=3
+          fi
+          for i in $(seq 1 "$attempts"); do
             got1="$(fetch_sha || true)"
             [ "$got1" = "$want" ] && break
-            sleep 10
+            # No pointless sleep after the final attempt.
+            [ "$i" -lt "$attempts" ] && sleep 10
           done
           got2="$(fetch_sha || true)"
           echo "Fetched sha256 (1st): ${got1:-<fetch failed>}"
@@ -326,6 +353,16 @@ jobs:
           echo 'Bindings pin the SHA-256 of the committed bytes; a divergent' >&2
           echo 'serving path breaks every client that pinned them.' >&2
           exit 1
+
+      # Belt and braces: the commit step already deletes the seed on the
+      # happy path, but any earlier failure would leave it on disk for
+      # the rest of the job. Runners are ephemeral, caches are not — and
+      # later steps/actions should never have seed material readable.
+      - name: Remove seed material
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/operator.seed"
+          find "$GITHUB_WORKSPACE" -type f -name '*.seed' -print -delete || true
 
       - name: Job summary
         if: always()
@@ -347,6 +384,7 @@ jobs:
             echo "- **Operator id**: \`${OPERATOR:-<not derived>}\`"
             echo "- **Fingerprint**: \`${FINGERPRINT:-<not derived>}\`"
             echo "- **Manifest sha256**: \`${digest:-<not signed>}\`"
+            echo "- **Signer**: \`onymchat/onym-discovery@$PINNED_SIGNER_REV\` (built from source)"
             echo "- New signing commit pushed: ${COMMITTED:-false}"
             echo
             echo 'The Discovery catalog pins this operator id: replace'
