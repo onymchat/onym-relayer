@@ -304,15 +304,68 @@ add required reviewers, and scope `RELAYER_OPERATOR_SEED` to that
 environment. Then every signing run waits for an approval before the
 seed is exposed to the job.
 
-Related caveat — **branch protection on `main`**: the workflow commits
-the signed bytes and pushes them to `main` with the default
-`GITHUB_TOKEN`. A branch-protection rule (or ruleset) on `main` that
-blocks direct pushes makes that push fail *after* signing has already
-happened — the run dies with the signed bytes stranded in the runner's
-workspace. If you protect `main`, either add a bypass for
-`github-actions[bot]` (rulesets support bypass actors) or expect to
-rework the commit step into a PR-based flow (open a PR with the signed
-bytes and gate the deploy/verify steps on its merge).
+Related caveat — **branch protection on `main`**: the workflow wants
+the signed bytes on `main` and pushes them with the default
+`GITHUB_TOKEN`. It attempts that direct push up to three times —
+retries cover ordinary concurrent-push races (rebase and push again)
+— but a ruleset rejection (GH013: pull requests required, as this
+repo's `main` ruleset is configured) is deterministic, so it skips
+straight to the **automatic PR fallback**: the signing commit is
+pushed to `signed-manifest/<run_id>`, any still-open signing PR from
+an earlier run is closed and its branch deleted (**newest signing
+wins** — merging a stale signing PR would publish older bytes), and a
+fresh PR against `main` is opened with the signer rev, operator
+fingerprint, and `validUntil` in the body. In that mode the run skips
+the deploy and byte-verification steps (the bytes are not on `main`
+yet) and links the PR from the job summary.
+
+The fallback PR is created in one of two modes:
+
+- **With the optional `SIGNING_PR_TOKEN` secret** (a PAT or GitHub
+  App token with `contents: write` and `pull-requests: write`): the
+  PR is created with that token, so **CI runs on the PR** —
+  `verify-operator-manifest` checks the pair in warn-mode before
+  merge.
+- **Without it** (default `GITHUB_TOKEN`): the PR is created, but it
+  **carries no CI runs at all** — GitHub's recursion guard means
+  events caused by a workflow's own token never trigger workflows, so
+  the PR shows zero checks. That is not a silent verification gap:
+  the signing run already verified the pair with the boot-path
+  verifier pre-push, and the post-merge push run on `main`
+  hard-verifies it again. The PR body and the run notice state this
+  plainly. This mode also requires the setting **"Allow GitHub
+  Actions to create and approve pull requests"** (Settings → Actions
+  → General, at both the org and repo level — the org setting caps
+  the repo one; currently enabled for this repo) or `gh pr create`
+  fails with a 403, which the workflow catches and explains.
+
+`main`'s ruleset currently has **no required status checks**, so the
+checks-less `GITHUB_TOKEN` PR is mergeable as-is. If required status
+checks are ever added to `main`, `SIGNING_PR_TOKEN` becomes
+**effectively mandatory**: a `GITHUB_TOKEN`-created PR would never
+receive the required check runs and could never be merged.
+
+**Merging that PR is the human step under protection.** The ruleset's
+pull-request requirement is satisfied by an admin merging it — note
+that your ruleset may also require an approval before the merge
+button lights up, and that this repo's ruleset requires **linear
+history and allows squash merge only**, so squash-merge the auto-PR.
+After the merge, `main` carries the signed bytes: CI's
+`verify-operator-manifest` check verifies the pair on `main`, and the
+deploy paths below pick the bytes up from there. For the App Platform
+path, re-dispatch the workflow *without* `skip_deploy` (signing is
+idempotent on unchanged src — nothing to commit, so the deploy and
+strict byte check run); for the onym-infra path, deploy the infra
+first and then re-dispatch *with* `skip_deploy=true` for the byte
+check.
+
+If you would rather keep the original one-shot flow, grant the
+GitHub Actions app a bypass in the `main` ruleset (rulesets support
+bypass actors); the direct push then succeeds and no PR is opened.
+That bypass and the "Allow GitHub Actions to create and approve pull
+requests" setting live in different places — the bypass is per-ruleset,
+the PR-creation switch is the org/repo Actions setting above — and
+only the latter matters to the fallback.
 
 ### Deploy paths
 
