@@ -304,15 +304,31 @@ add required reviewers, and scope `RELAYER_OPERATOR_SEED` to that
 environment. Then every signing run waits for an approval before the
 seed is exposed to the job.
 
-Related caveat — **branch protection on `main`**: the workflow commits
-the signed bytes and pushes them to `main` with the default
-`GITHUB_TOKEN`. A branch-protection rule (or ruleset) on `main` that
-blocks direct pushes makes that push fail *after* signing has already
-happened — the run dies with the signed bytes stranded in the runner's
-workspace. If you protect `main`, either add a bypass for
-`github-actions[bot]` (rulesets support bypass actors) or expect to
-rework the commit step into a PR-based flow (open a PR with the signed
-bytes and gate the deploy/verify steps on its merge).
+Related caveat — **branch protection on `main`**: the workflow wants
+the signed bytes on `main` and pushes them with the default
+`GITHUB_TOKEN`. It attempts that direct push exactly once; under a
+ruleset that requires pull requests on `main` (as this repo's does),
+GitHub rejects the push (GH013) and the workflow **automatically falls
+back to a PR**: it pushes the signing commit to
+`signed-manifest/<run_id>` and opens a PR against `main` with the
+signer rev, operator fingerprint, and `validUntil` in the body. In
+that mode the run skips the deploy and byte-verification steps (the
+bytes are not on `main` yet) and links the PR from the job summary.
+
+**Merging that PR is the human step under protection.** The ruleset's
+pull-request requirement is satisfied by an admin merging it — note
+that your ruleset may also require an approval before the merge
+button lights up. After the merge, `main` carries the signed bytes:
+CI's `verify-operator-manifest` check verifies the pair on `main`,
+and the deploy paths below pick the bytes up from there (for the
+served-byte check, dispatch the workflow again with
+`skip_deploy=true` — signing is idempotent on unchanged src, so it
+finds nothing to commit and just verifies).
+
+If you would rather keep the original one-shot flow, grant the
+GitHub Actions app a bypass in the `main` ruleset (rulesets support
+bypass actors); the single direct-push attempt then succeeds and no
+PR is opened.
 
 ### Deploy paths
 

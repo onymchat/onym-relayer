@@ -12,9 +12,13 @@ name: Sign operator manifest
 # The signed file reaches the container through the image: the
 # Dockerfile copies manifest-signed/ to /srv/operator-manifest/, and
 # RELAYER_OPERATOR_MANIFEST points the service at it. Because the image
-# is built from the repo, this run MUST be dispatched on main and it
-# commits to main directly — a signed manifest on a side branch would
-# never reach a deployed image.
+# is built from the repo, this run MUST be dispatched on main and the
+# signed bytes must land ON main — a signed manifest on a side branch
+# would never reach a deployed image. The commit step tries one direct
+# push (works only if the Actions app has a ruleset bypass); when the
+# main ruleset rejects it (GH013: pull_request required), it falls back
+# to pushing branch signed-manifest/<run_id> and opening a PR, and the
+# deploy/byte-verification steps are skipped until that PR merges.
 #
 # Deploy paths:
 #   * DigitalOcean App Platform (scripts/deploy-digitalocean.sh
@@ -61,6 +65,8 @@ on:
 
 permissions:
   contents: write
+  # For the PR fallback: gh pr create / gh pr edit with github.token.
+  pull-requests: write
 
 # Two runs racing would both sign and race the push to main; serialize.
 concurrency:
@@ -250,6 +256,10 @@ jobs:
 
       - name: Commit signed bytes to main
         id: commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPERATOR: ${{ steps.identity.outputs.operator }}
+          FINGERPRINT: ${{ steps.identity.outputs.fingerprint }}
         run: |
           rm -f "$RUNNER_TEMP/operator.seed"
           # The pinned signer writes a detached "$MANIFEST_OUT.sig"
@@ -263,6 +273,7 @@ jobs:
           if git diff --cached --quiet; then
             echo 'Signed bytes are unchanged — nothing to commit.'
             echo "committed=false" >> "$GITHUB_OUTPUT"
+            echo "mode=none" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git config user.name 'github-actions[bot]'
@@ -272,31 +283,83 @@ jobs:
             -m 'Signed in CI by the sign-manifest workflow. manifest-signed/manifest.json
           is served byte-for-byte at GET /manifest.json; bindings pin its SHA-256.' \
             -m "Signer: onymchat/onym-discovery@$PINNED_SIGNER_REV (built from source at this pinned rev)"
-          # Retry the rebase+push a few times: main can move under this
-          # job (merges land while it runs), and losing the signed
-          # bytes to a push race after signing succeeded would leave
-          # the run red with nothing recoverable in the repo.
-          pushed=false
-          for attempt in 1 2 3; do
-            if git pull --rebase origin main && git push origin HEAD:main; then
-              pushed=true
-              break
-            fi
-            echo "push attempt $attempt failed — retrying" >&2
-            git rebase --abort 2>/dev/null || true
-            sleep $((attempt * 5))
-          done
-          if [ "$pushed" != "true" ]; then
-            echo 'Could not push the signing commit to main after 3 attempts.' >&2
-            exit 1
+          # ONE direct-push attempt: it succeeds only if the Actions app
+          # has (ever gets) a bypass in the main ruleset. Under the
+          # ruleset as configured (pull_request required + linear
+          # history) it fails with GH013 — the PR fallback below
+          # replaces the old retry loop, so a plain push race also
+          # lands in the fallback instead of killing the run with the
+          # signed bytes stranded in the runner's workspace.
+          if git pull --rebase origin main && git push origin HEAD:main; then
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+            echo "mode=direct" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          echo "committed=true" >> "$GITHUB_OUTPUT"
+          git rebase --abort 2>/dev/null || true
+          echo 'Direct push to main rejected (expected under the main ruleset:' >&2
+          echo 'pull_request is required — GH013). Falling back to a PR.' >&2
+          branch="signed-manifest/${GITHUB_RUN_ID}"
+          git push origin "HEAD:refs/heads/$branch"
+          valid_until="$(jq -r '.validUntil // "<missing>"' "$MANIFEST_OUT")"
+          {
+            echo 'Signed in CI by the sign-manifest workflow. The main ruleset'
+            echo 'rejected the direct push (GH013: pull_request required), so the'
+            echo 'signing commit arrives via this PR instead. Merging it is the'
+            echo 'human step that lands the signed bytes on main.'
+            echo
+            echo "- **Signer**: \`onymchat/onym-discovery@$PINNED_SIGNER_REV\` (built from source at the pinned rev)"
+            echo "- **Operator id**: \`${OPERATOR:-<not derived>}\`"
+            echo "- **Operator fingerprint**: \`${FINGERPRINT:-<not derived>}\`"
+            echo "- **validUntil**: \`$valid_until\`"
+            echo
+            echo 'CI verifies the manifest/signature pair with the boot-path'
+            echo 'verifier (verify-operator-manifest): warn-mode on this PR,'
+            echo 'hard-fail on main once merged. Deploy and'
+            echo 'served-byte verification happen after merge — see the signing'
+            echo "run's job summary for the exact steps."
+          } > "$RUNNER_TEMP/pr-body.md"
+          pr_url="$(gh pr create --base main --head "$branch" \
+            --title "Publish signed operator manifest ($(date -u +%Y-%m-%d))" \
+            --body-file "$RUNNER_TEMP/pr-body.md")"
+          # Label only when the repo already has a matching label —
+          # minting labels is not this workflow's business, and a
+          # missing label must not fail the run post-signing.
+          for lbl in signed-manifest automated; do
+            if gh label list --json name --jq '.[].name' | grep -Fxq "$lbl"; then
+              gh pr edit "$pr_url" --add-label "$lbl" || true
+            fi
+          done
+          echo "committed=false" >> "$GITHUB_OUTPUT"
+          echo "mode=pr" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+          echo "Opened $pr_url — merge it to land the signed bytes on main."
+
+      # PR-fallback mode: the signed bytes are NOT on main yet, so
+      # deploying or byte-checking now would deploy/verify a stale
+      # manifest. Every deploy/verify step below is gated on
+      # mode != 'pr'; this step says so loudly instead of leaving a
+      # trail of silently skipped steps.
+      - name: Signed bytes await PR merge (deploy/verify skipped)
+        if: ${{ steps.commit.outputs.mode == 'pr' }}
+        env:
+          PR_URL: ${{ steps.commit.outputs.pr_url }}
+        run: |
+          echo "::notice::Signed bytes await PR merge: $PR_URL — deploy and byte verification are skipped in this run."
+          echo 'The bytes are not on main yet, so this run stops before the'
+          echo 'deploy/byte-verification steps. After the PR merges, main carries'
+          echo 'the signed bytes: the onym-infra deploy path picks them up from'
+          echo 'main (bump the relayer submodule, set RELAYER_OPERATOR_MANIFEST'
+          echo 'in relayer.env, deploy), and verification is covered by CI'\''s'
+          echo 'verify-operator-manifest check plus the infra deploy. To byte-check'
+          echo 'the served endpoint afterwards, dispatch this workflow again with'
+          echo 'skip_deploy=true — signing is idempotent on unchanged src, so it'
+          echo 'finds nothing to commit and just checks the served bytes.'
 
       # Checked in its own step BEFORE digitalocean/action-doctl: with
       # an empty token that action dies with an opaque auth error, and
       # the operator never sees the skip_deploy hint.
       - name: Require DO_API_KEY
-        if: ${{ !inputs.skip_deploy }}
+        if: ${{ !inputs.skip_deploy && steps.commit.outputs.mode != 'pr' }}
         env:
           DO_API_KEY: ${{ secrets.DO_API_KEY }}
         run: |
@@ -308,7 +371,7 @@ jobs:
           fi
 
       - name: Install doctl
-        if: ${{ !inputs.skip_deploy }}
+        if: ${{ !inputs.skip_deploy && steps.commit.outputs.mode != 'pr' }}
         uses: digitalocean/action-doctl@v2
         with:
           token: ${{ secrets.DO_API_KEY }}
@@ -324,7 +387,7 @@ jobs:
       # image deployment that App Platform sequences after it; the
       # byte-verification step's retry loop absorbs its rollout.
       - name: Set RELAYER_OPERATOR_MANIFEST in the app spec
-        if: ${{ !inputs.skip_deploy }}
+        if: ${{ !inputs.skip_deploy && steps.commit.outputs.mode != 'pr' }}
         id: spec
         run: |
           app_id="$(doctl apps list --format ID,Spec.Name --no-header \
@@ -384,7 +447,7 @@ jobs:
           fi
 
       - name: Build and push image to DOCR
-        if: ${{ !inputs.skip_deploy }}
+        if: ${{ !inputs.skip_deploy && steps.commit.outputs.mode != 'pr' }}
         run: |
           registry="$(doctl registry get --format Name --no-header)"
           if [ -z "$registry" ]; then
@@ -404,7 +467,7 @@ jobs:
       # build+rollout, and a deployment that ERRORs should say so
       # instead of surfacing as a mysterious byte mismatch.
       - name: Wait for the image deployment to go ACTIVE
-        if: ${{ !inputs.skip_deploy }}
+        if: ${{ !inputs.skip_deploy && steps.commit.outputs.mode != 'pr' }}
         env:
           APP_ID: ${{ steps.spec.outputs.app_id }}
         run: |
@@ -430,7 +493,11 @@ jobs:
           echo '::warning::Deployment did not reach ACTIVE within the wait' \
             'budget; proceeding to byte verification, which decides pass/fail.'
 
+      # Skipped in PR-fallback mode: the served endpoint cannot match
+      # bytes that are not on main (or in any image) yet, so a byte
+      # check now would only produce a misleading mismatch.
       - name: Verify served bytes
+        if: ${{ steps.commit.outputs.mode != 'pr' }}
         env:
           SKIP_DEPLOY: ${{ inputs.skip_deploy }}
         run: |
@@ -507,6 +574,7 @@ jobs:
           OPERATOR: ${{ steps.identity.outputs.operator }}
           FINGERPRINT: ${{ steps.identity.outputs.fingerprint }}
           COMMITTED: ${{ steps.commit.outputs.committed }}
+          PR_URL: ${{ steps.commit.outputs.pr_url }}
         run: |
           digest=""
           if [ -f "$MANIFEST_OUT" ]; then
@@ -523,6 +591,13 @@ jobs:
             echo "- **Manifest sha256**: \`${digest:-<not signed>}\`"
             echo "- **Signer**: \`onymchat/onym-discovery@$PINNED_SIGNER_REV\` (built from source)"
             echo "- New signing commit pushed: ${COMMITTED:-false}"
+            if [ -n "$PR_URL" ]; then
+              echo "- **Signing PR (awaiting merge)**: $PR_URL"
+              echo
+              echo 'The main ruleset rejected the direct push, so the signed bytes'
+              echo 'travel via the PR above. Merge it to land them on main; deploy'
+              echo 'and served-byte verification were skipped in this run.'
+            fi
             echo
             echo 'The Discovery catalog pins this operator id: replace'
             echo '`onym:key:REPLACE-RELAYER-KEY` in onym-discovery'
