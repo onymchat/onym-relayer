@@ -17,9 +17,31 @@ use crate::validation::{self, RateLimiter, READ_ONLY_FUNCTIONS};
 pub struct AppState {
     pub config: Config,
     pub rate_limiter: RateLimiter,
-    /// Verified at boot; served byte-for-byte. None = endpoint absent.
-    pub operator_manifest: Option<crate::operator_manifest::OperatorManifest>,
+    /// Verified at boot; served byte-for-byte when published.
+    pub operator_manifest: OperatorManifestState,
 }
+
+/// What the manifest endpoints serve. Tri-state on purpose: "this
+/// deployment never publishes a manifest" and "the manifest is signed
+/// correctly but its validUntil lapsed" both 404, but with different
+/// bodies — an operator (or a probing client) must be able to tell
+/// "nothing here by design" from "re-sign required". The relayer keeps
+/// relaying transactions in both cases; only `Invalid` (corruption)
+/// refuses boot, and that never reaches this enum.
+pub enum OperatorManifestState {
+    /// `RELAYER_OPERATOR_MANIFEST` unset — endpoint absent by design.
+    Absent,
+    /// Verified signature, lapsed validUntil: degraded, not dead.
+    Expired,
+    /// Verified and current — served byte-for-byte.
+    Published(crate::operator_manifest::OperatorManifest),
+}
+
+/// The distinct 404 body for the expired case (also asserted by tests;
+/// keep in sync with nothing — this constant IS the single source).
+pub const MANIFEST_EXPIRED_MESSAGE: &str =
+    "operator manifest expired — re-sign required (bump validUntil in \
+     operator-manifest.src.json and dispatch the sign-manifest workflow)";
 
 /// Incoming request from mobile apps.
 #[derive(Deserialize)]
@@ -1718,22 +1740,100 @@ mod tests {
         );
         assert!(field_value(&neither, MAX_ENTRIES_KEYS).is_none());
     }
+
+    // ---- operator-manifest endpoint tri-state tests ----
+
+    fn state_with_manifest(operator_manifest: OperatorManifestState) -> Arc<AppState> {
+        Arc::new(AppState {
+            config: test_config(),
+            rate_limiter: RateLimiter::new(30),
+            operator_manifest,
+        })
+    }
+
+    async fn body_string(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn expired_manifest_serves_distinct_404_on_both_endpoints() {
+        // The degraded state main.rs enters on LoadError::Expired: the
+        // process is up (transactions flow), the manifest endpoints
+        // 404 with the explicit re-sign message — distinguishable from
+        // "this deployment publishes no manifest".
+        let state = state_with_manifest(OperatorManifestState::Expired);
+        for response in [
+            handle_operator_manifest(State(state.clone())).await,
+            handle_operator_manifest_sig(State(state.clone())).await,
+        ] {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = body_string(response).await;
+            assert!(
+                body.contains("operator manifest expired — re-sign required"),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_manifest_serves_generic_404() {
+        let state = state_with_manifest(OperatorManifestState::Absent);
+        for response in [
+            handle_operator_manifest(State(state.clone())).await,
+            handle_operator_manifest_sig(State(state.clone())).await,
+        ] {
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = body_string(response).await;
+            assert!(body.contains("publishes no operator manifest"), "{body}");
+            assert!(!body.contains("expired"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn published_manifest_serves_exact_bytes() {
+        let raw = br#"{"seat":"notary"}"#.to_vec();
+        let state = state_with_manifest(OperatorManifestState::Published(
+            crate::operator_manifest::OperatorManifest {
+                raw: raw.clone(),
+                detached_signature: "c2ln".to_string(),
+                operator: "onym:key:00".to_string(),
+            },
+        ));
+        let response = handle_operator_manifest(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_string(response).await.as_bytes(), raw.as_slice());
+
+        let response = handle_operator_manifest_sig(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_string(response).await, "c2ln\n");
+    }
 }
 
 /// `GET /manifest.json` — the relayer's signed notary-operator
 /// manifest, served **byte-for-byte**. Discovery catalogs and group
 /// bindings pin the SHA-256 of exactly these bytes; re-serialization
 /// here would break every pin. 404 when the deployment has not
-/// published a manifest (`RELAYER_OPERATOR_MANIFEST` unset).
+/// published a manifest (`RELAYER_OPERATOR_MANIFEST` unset), and 404
+/// with a distinct "expired — re-sign required" body when the manifest
+/// verified but its validUntil lapsed (the relayer itself keeps
+/// serving transactions in that case; see main.rs).
 pub async fn handle_operator_manifest(State(state): State<Arc<AppState>>) -> Response {
     match &state.operator_manifest {
-        Some(manifest) => (
+        OperatorManifestState::Published(manifest) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             manifest.raw.clone(),
         )
             .into_response(),
-        None => (
+        OperatorManifestState::Expired => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": MANIFEST_EXPIRED_MESSAGE })),
+        )
+            .into_response(),
+        OperatorManifestState::Absent => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "this deployment publishes no operator manifest" })),
         )
@@ -1746,13 +1846,18 @@ pub async fn handle_operator_manifest(State(state): State<Arc<AppState>>) -> Res
 /// parsing (the same convention the moderation authority serves).
 pub async fn handle_operator_manifest_sig(State(state): State<Arc<AppState>>) -> Response {
     match &state.operator_manifest {
-        Some(manifest) => (
+        OperatorManifestState::Published(manifest) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "text/plain")],
             format!("{}\n", manifest.detached_signature),
         )
             .into_response(),
-        None => (
+        OperatorManifestState::Expired => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": MANIFEST_EXPIRED_MESSAGE })),
+        )
+            .into_response(),
+        OperatorManifestState::Absent => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "this deployment publishes no operator manifest" })),
         )

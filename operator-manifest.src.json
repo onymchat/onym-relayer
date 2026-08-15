@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "componentId": "onym:component:onym-relayer",
+  "seat": "notary",
+  "operator": "onym:key:REPLACE-OPERATOR-KEY",
+  "implementationProfiles": [
+    "onym:notary-implementation:stellar-soroban-sep-plonk-v1"
+  ],
+  "networks": [
+    {
+      "namespace": "stellar:cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472",
+      "network": "testnet",
+      "submitterAccount": "GBVO624Q43IHD7MMDJKOPLOLBWCDI7HUX5VMROUV7MXR64JW5GTEIKAC",
+      "role": "fee-payer"
+    }
+  ],
+  "powers": {
+    "gateCreation": true,
+    "setRestrictedMode": ["manifest-mirror"],
+    "allowlistControl": "manifest-mirror",
+    "canAuthorTransitions": false,
+    "canRewriteState": false,
+    "canCensorSubmission": true
+  },
+  "offers": [
+    {
+      "offerId": "relayer-free-v1",
+      "model": "free"
+    }
+  ],
+  "validUntil": "2027-08-14T00:00:00Z"
+}

@@ -20,6 +20,37 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::Value;
 
+/// Why a manifest failed to load. The split is the whole point:
+/// `Expired` means the bytes are authentic (the signature verifies
+/// against the embedded operator key) but `validUntil` has passed —
+/// the relayer keeps serving transactions and only degrades the
+/// manifest endpoints, because killing the relayer on a *date* would
+/// turn every lapsed re-signing into a full transaction outage.
+/// `Invalid` means corruption (bad signature, wrong seat, malformed
+/// fields …) and refuses boot: serving unverifiable bytes would
+/// poison every client that pins them.
+#[derive(Debug)]
+pub enum LoadError {
+    /// Signature verifies, but `validUntil` is in the past.
+    Expired { valid_until: String },
+    /// Anything else — the manifest cannot be trusted at all.
+    Invalid(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Expired { valid_until } => write!(
+                f,
+                "manifest EXPIRED: validUntil {valid_until} is in the past — clients \
+                 reject expired manifests; bump validUntil in operator-manifest.src.json \
+                 and re-run the sign-manifest workflow"
+            ),
+            LoadError::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Verified manifest state held for the lifetime of the process.
 #[derive(Debug)]
 pub struct OperatorManifest {
@@ -33,7 +64,25 @@ pub struct OperatorManifest {
     pub operator: String,
 }
 
-pub fn load_and_verify(path: &std::path::Path) -> Result<OperatorManifest, String> {
+pub fn load_and_verify(path: &std::path::Path) -> Result<OperatorManifest, LoadError> {
+    // Structural + signature checks first: only a manifest whose
+    // signature already verifies can earn the softer `Expired` outcome.
+    // An expired AND tampered manifest is corruption, not lapse.
+    let (manifest, valid_until, until) =
+        verify_structure_and_signature(path).map_err(LoadError::Invalid)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| LoadError::Invalid(format!("system clock before epoch: {e}")))?
+        .as_secs() as i64;
+    if until <= now {
+        return Err(LoadError::Expired { valid_until });
+    }
+    Ok(manifest)
+}
+
+fn verify_structure_and_signature(
+    path: &std::path::Path,
+) -> Result<(OperatorManifest, String, i64), String> {
     let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let value: Value =
         serde_json::from_slice(&raw).map_err(|e| format!("manifest is not valid JSON: {e}"))?;
@@ -83,6 +132,18 @@ pub fn load_and_verify(path: &std::path::Path) -> Result<OperatorManifest, Strin
         .try_into()
         .map_err(|_| "signature must be 64 bytes".to_string())?;
 
+    // Expiry material: a missing or malformed validUntil is corruption
+    // (`Invalid`); the actual past/future comparison lives in
+    // `load_and_verify`, AFTER the signature verifies, so only an
+    // authentic manifest can be merely `Expired`.
+    let valid_until = object
+        .get("validUntil")
+        .and_then(Value::as_str)
+        .ok_or("manifest must declare validUntil")?
+        .to_string();
+    let until =
+        parse_rfc3339_utc(&valid_until).map_err(|e| format!("validUntil {valid_until:?}: {e}"))?;
+
     // Canonical signing bytes: structural removal, sorted keys.
     let mut unsigned = value.clone();
     unsigned
@@ -94,11 +155,144 @@ pub fn load_and_verify(path: &std::path::Path) -> Result<OperatorManifest, Strin
         .verify(&canonical, &Signature::from_bytes(&signature_bytes))
         .map_err(|_| "manifest signature does not verify against its operator key".to_string())?;
 
-    Ok(OperatorManifest {
-        raw,
-        detached_signature: signature_b64,
-        operator,
-    })
+    Ok((
+        OperatorManifest {
+            raw,
+            detached_signature: signature_b64,
+            operator,
+        },
+        valid_until,
+        until,
+    ))
+}
+
+/// Parse an RFC 3339 timestamp (`2027-08-14T00:00:00Z`, fractional
+/// seconds and numeric offsets accepted) to Unix seconds. Hand-rolled
+/// on purpose: the expiry comparison is the only date arithmetic in
+/// the crate, so a whole datetime dependency is not warranted. Uses
+/// the days-from-civil algorithm (Howard Hinnant's formulation).
+fn parse_rfc3339_utc(s: &str) -> Result<i64, String> {
+    let bytes = s.as_bytes();
+    let digits = |range: std::ops::Range<usize>| -> Result<i64, String> {
+        let part = bytes
+            .get(range.clone())
+            .ok_or_else(|| format!("truncated at byte {}", range.start))?;
+        if !part.iter().all(u8::is_ascii_digit) {
+            // from_utf8_lossy, never `&s[range]`: a byte range can land
+            // mid-character on non-ASCII input, and slicing the &str
+            // there PANICS — in an error path that runs before the
+            // signature has even been checked.
+            return Err(format!("non-digit in {:?}", String::from_utf8_lossy(part)));
+        }
+        Ok(std::str::from_utf8(part).unwrap().parse().unwrap())
+    };
+    let sep = |index: usize, expected: &[u8]| -> Result<(), String> {
+        match bytes.get(index) {
+            Some(b) if expected.contains(&b.to_ascii_uppercase()) => Ok(()),
+            other => Err(format!(
+                "expected one of {:?} at byte {index}, got {:?}",
+                std::str::from_utf8(expected).unwrap(),
+                other.map(|&b| b as char),
+            )),
+        }
+    };
+    let (year, month, day) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
+    sep(4, b"-")?;
+    sep(7, b"-")?;
+    sep(10, b"T")?; // to_ascii_uppercase above also admits lowercase t
+    let (hour, minute, second) = (digits(11..13)?, digits(14..16)?, digits(17..19)?);
+    sep(13, b":")?;
+    sep(16, b":")?;
+    // second == 60 (a leap second) is valid RFC 3339, but we reject it
+    // on purpose: this parses a boot gate's expiry date, strictness
+    // beats cleverness, and no sane signing tool emits :60 in a
+    // manifest expiry. Accepting it would trade a clear refusal for a
+    // once-a-decade edge case nobody exercises.
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return Err("date/time component out of range".into());
+    }
+    // Real calendar days only: Feb 30 or Apr 31 in a validUntil is a
+    // typo that must be refused, not silently normalized into some
+    // other date by the days-from-civil arithmetic below.
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return Err(format!("day {day} out of range for month {month}"));
+    }
+
+    // Fractional seconds are ignored (sub-second expiry precision is
+    // meaningless here); then Z or a numeric offset, nothing after.
+    let mut index = 19;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == start {
+            return Err("empty fractional seconds".into());
+        }
+    }
+    let offset_seconds = match bytes.get(index) {
+        Some(b'Z') | Some(b'z') if index + 1 == bytes.len() => 0,
+        Some(sign @ (b'+' | b'-')) if index + 6 == bytes.len() => {
+            let (oh, om) = (digits(index + 1..index + 3)?, digits(index + 4..index + 6)?);
+            sep(index + 3, b":")?;
+            if oh > 23 || om > 59 {
+                return Err("UTC offset out of range".into());
+            }
+            (oh * 3600 + om * 60) * if *sign == b'+' { 1 } else { -1 }
+        }
+        _ => return Err("must end in Z or a +HH:MM/-HH:MM offset".into()),
+    };
+
+    // Days since 1970-01-01 for a proleptic-Gregorian civil date.
+    let year_shifted = year - i64::from(month <= 2);
+    let era = year_shifted.div_euclid(400);
+    let year_of_era = year_shifted - era * 400;
+    let month_shifted = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_shifted + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146097 + day_of_era - 719468;
+    Ok(days * 86400 + hour * 3600 + minute * 60 + second - offset_seconds)
+}
+
+/// [`load_and_verify`] plus, when a detached signature file is given,
+/// the agreement check the discovery spec calls for (§3 of the
+/// signing rule): the detached bytes must be the SAME signature the
+/// manifest embeds, whitespace aside. A disagreeing pair is refused
+/// even if each would verify on its own — tooling that verifies the
+/// detached form before parsing must see exactly what parsers see.
+pub fn verify_file(
+    path: &std::path::Path,
+    sig_path: Option<&std::path::Path>,
+) -> Result<OperatorManifest, String> {
+    // The CLI/CI caller flattens `Expired` back into a failure on
+    // purpose: `verify-operator-manifest` gates signing and scheduled
+    // CI, where an expired manifest must be red — the boots-anyway
+    // leniency belongs only to the serving process (main.rs).
+    let manifest = load_and_verify(path).map_err(|e| e.to_string())?;
+    if let Some(sig_path) = sig_path {
+        let detached = std::fs::read_to_string(sig_path)
+            .map_err(|e| format!("read {}: {e}", sig_path.display()))?;
+        if detached.trim() != manifest.detached_signature {
+            return Err(format!(
+                "detached signature at {} does not match the embedded signature",
+                sig_path.display()
+            ));
+        }
+    }
+    Ok(manifest)
 }
 
 #[cfg(test)]
@@ -107,6 +301,10 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     fn signed_manifest(seat: &str, tamper: bool) -> Vec<u8> {
+        signed_manifest_at(seat, tamper, "2030-01-01T00:00:00Z")
+    }
+
+    fn signed_manifest_at(seat: &str, tamper: bool, valid_until: &str) -> Vec<u8> {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let operator = format!("onym:key:{}", hex::encode(key.verifying_key().to_bytes()));
         let mut doc = serde_json::json!({
@@ -115,7 +313,7 @@ mod tests {
             "seat": seat,
             "operator": operator,
             "powers": { "gateCreation": true, "canAuthorTransitions": false },
-            "validUntil": "2030-01-01T00:00:00Z",
+            "validUntil": valid_until,
         });
         let canonical = serde_json::to_vec(&doc).unwrap();
         let signature = key.sign(&canonical);
@@ -158,8 +356,193 @@ mod tests {
         let bytes = signed_manifest("notary", true);
         let path = write_temp("tampered", &bytes);
         let err = load_and_verify(&path).unwrap_err();
-        assert!(err.contains("does not verify"), "{err}");
+        assert!(matches!(err, LoadError::Invalid(_)), "{err:?}");
+        assert!(err.to_string().contains("does not verify"), "{err}");
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn agreeing_detached_signature_accepted() {
+        let bytes = signed_manifest("notary", false);
+        let path = write_temp("detached-ok", &bytes);
+        let embedded: Value = serde_json::from_slice(&bytes).unwrap();
+        let sig = embedded["signature"].as_str().unwrap();
+        // The signer CLI writes the base64 line with a trailing newline.
+        let sig_path = write_temp("detached-ok-sig", format!("{sig}\n").as_bytes());
+        verify_file(&path, Some(&sig_path)).unwrap();
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(sig_path).ok();
+    }
+
+    #[test]
+    fn disagreeing_detached_signature_refused() {
+        let bytes = signed_manifest("notary", false);
+        let path = write_temp("detached-bad", &bytes);
+        let sig_path = write_temp("detached-bad-sig", b"AAAA not the embedded signature\n");
+        let err = verify_file(&path, Some(&sig_path)).unwrap_err();
+        assert!(err.contains("does not match the embedded"), "{err}");
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(sig_path).ok();
+    }
+
+    #[test]
+    fn expired_manifest_is_the_distinct_expired_outcome() {
+        // Expired-but-authentic is NOT corruption: main.rs boots the
+        // relayer and degrades only the manifest endpoints on this
+        // variant, so it must be distinguishable from Invalid.
+        let bytes = signed_manifest_at("notary", false, "2020-01-01T00:00:00Z");
+        let path = write_temp("expired", &bytes);
+        let err = load_and_verify(&path).unwrap_err();
+        assert!(
+            matches!(&err, LoadError::Expired { valid_until } if valid_until == "2020-01-01T00:00:00Z"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("EXPIRED"), "{err}");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn expired_and_tampered_is_invalid_not_expired() {
+        // The Expired leniency is only for authentic bytes: the
+        // signature is checked BEFORE the date, so an expired manifest
+        // with a broken signature is corruption and refuses boot.
+        let bytes = signed_manifest_at("notary", true, "2020-01-01T00:00:00Z");
+        let path = write_temp("expired-tampered", &bytes);
+        let err = load_and_verify(&path).unwrap_err();
+        assert!(matches!(err, LoadError::Invalid(_)), "{err:?}");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn future_valid_until_accepted() {
+        // The default helper date (2030) IS the future case, but make
+        // the intent explicit and independent of the helper default.
+        let bytes = signed_manifest_at("notary", false, "2099-12-31T23:59:59Z");
+        let path = write_temp("future", &bytes);
+        load_and_verify(&path).unwrap();
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn malformed_valid_until_refused() {
+        for bad in [
+            "soon",
+            "2030-13-01T00:00:00Z",
+            "2030-01-01",
+            "2030-01-01T00:00:00",
+        ] {
+            let bytes = signed_manifest_at("notary", false, bad);
+            let path = write_temp("malformed", &bytes);
+            let err = load_and_verify(&path).unwrap_err();
+            assert!(matches!(err, LoadError::Invalid(_)), "{bad}: {err:?}");
+            assert!(err.to_string().contains("validUntil"), "{bad}: {err}");
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn non_ascii_valid_until_errors_cleanly_instead_of_panicking() {
+        // Regression: the error path used `&s[range]` on the input
+        // string; a byte range ending mid-character on non-ASCII input
+        // panicked before the signature was even checked. It must be a
+        // clean Invalid error instead.
+        for bad in ["203é-01-01T00:00:00Z", "２０３０-01-01T00:00:00Z"] {
+            let parse_err = parse_rfc3339_utc(bad).unwrap_err();
+            assert!(parse_err.contains("non-digit"), "{bad}: {parse_err}");
+            let bytes = signed_manifest_at("notary", false, bad);
+            let path = write_temp("non-ascii", &bytes);
+            let err = load_and_verify(&path).unwrap_err();
+            assert!(matches!(err, LoadError::Invalid(_)), "{bad}: {err:?}");
+            assert!(err.to_string().contains("validUntil"), "{bad}: {err}");
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn impossible_calendar_dates_refused() {
+        for bad in [
+            "2030-02-30T00:00:00Z",
+            "2030-02-31T00:00:00Z",
+            "2030-04-31T00:00:00Z",
+            "2030-06-31T00:00:00Z",
+            "2029-02-29T00:00:00Z", // 2029 is not a leap year
+            "2100-02-29T00:00:00Z", // century rule: 2100 is not a leap year
+            "2030-01-00T00:00:00Z",
+            "2030-01-32T00:00:00Z",
+        ] {
+            assert!(parse_rfc3339_utc(bad).is_err(), "{bad:?} should not parse");
+        }
+        // Real leap days parse (2028: /4 rule; 2000: /400 rule).
+        assert!(parse_rfc3339_utc("2028-02-29T00:00:00Z").is_ok());
+        assert!(parse_rfc3339_utc("2000-02-29T00:00:00Z").is_ok());
+    }
+
+    #[test]
+    fn leap_second_refused_by_choice() {
+        // second == 60 is valid RFC 3339; the parser rejects it on
+        // purpose (strict boot gate — see the comment in the parser).
+        assert!(parse_rfc3339_utc("2030-06-30T23:59:60Z").is_err());
+        assert!(parse_rfc3339_utc("2030-06-30T23:59:59Z").is_ok());
+    }
+
+    #[test]
+    fn missing_valid_until_refused() {
+        // Build a signed manifest with NO validUntil at all: the field
+        // is part of the terms clients pin, so its absence is refused
+        // rather than treated as "never expires".
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let operator = format!("onym:key:{}", hex::encode(key.verifying_key().to_bytes()));
+        let mut doc = serde_json::json!({
+            "version": 1,
+            "componentId": "onym:component:onym-relayer",
+            "seat": "notary",
+            "operator": operator,
+        });
+        let canonical = serde_json::to_vec(&doc).unwrap();
+        let sig_b64 =
+            base64::engine::general_purpose::STANDARD.encode(key.sign(&canonical).to_bytes());
+        doc.as_object_mut()
+            .unwrap()
+            .insert("signature".into(), Value::String(sig_b64));
+        let path = write_temp("no-validuntil", &serde_json::to_vec(&doc).unwrap());
+        let err = load_and_verify(&path).unwrap_err();
+        assert!(matches!(err, LoadError::Invalid(_)), "{err:?}");
+        assert!(err.to_string().contains("validUntil"), "{err}");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn parse_rfc3339_utc_handles_offsets_and_fractions() {
+        assert_eq!(parse_rfc3339_utc("1970-01-01T00:00:00Z").unwrap(), 0);
+        assert_eq!(
+            parse_rfc3339_utc("2027-08-14T00:00:00Z").unwrap(),
+            1818201600
+        );
+        // Offset and fractional forms of the same instant.
+        assert_eq!(
+            parse_rfc3339_utc("2027-08-14T02:30:00+02:30").unwrap(),
+            1818201600
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2027-08-13T22:00:00-02:00").unwrap(),
+            1818201600
+        );
+        assert_eq!(
+            parse_rfc3339_utc("2027-08-14T00:00:00.500Z").unwrap(),
+            1818201600
+        );
+        for bad in [
+            "",
+            "2027-08-14",
+            "2027-08-14T00:00:00",
+            "2027-08-14 00:00:00Z",
+            "2027-08-14T00:00:00+0200",
+            "2027-08-14T00:00:00.Z",
+            "2027-08-14T25:00:00Z",
+            "not-a-date",
+        ] {
+            assert!(parse_rfc3339_utc(bad).is_err(), "{bad:?} should not parse");
+        }
     }
 
     #[test]
@@ -167,7 +550,8 @@ mod tests {
         let bytes = signed_manifest("moderation", false);
         let path = write_temp("wrongseat", &bytes);
         let err = load_and_verify(&path).unwrap_err();
-        assert!(err.contains("seat"), "{err}");
+        assert!(matches!(err, LoadError::Invalid(_)), "{err:?}");
+        assert!(err.to_string().contains("seat"), "{err}");
         std::fs::remove_file(path).ok();
     }
 }

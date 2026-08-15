@@ -37,6 +37,15 @@ jobs:
           cargo fmt --check
           cargo test
 
+      # Shared with ci.yml so the tripwires cannot diverge; see the
+      # script headers. A release is cut by someone who can dispatch
+      # sign-manifest, so the expiry check hard-fails here.
+      - name: Operator manifest drift check
+        run: scripts/check-manifest-drift.sh
+
+      - name: Operator manifest validUntil check
+        run: scripts/check-manifest-expiry.sh
+
       - name: Validate manifests
         run: |
           scripts/validate-relayers-manifest.py "$RELAYERS_JSON"

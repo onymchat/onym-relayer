@@ -222,6 +222,7 @@ IMAGE_REPOSITORY="$IMAGE_REPOSITORY" \
 IMAGE_TAG="$IMAGE_TAG" \
 ENV_FILE="$ENV_FILE" \
 SPEC_FILE="$SPEC_FILE" \
+ROOT_DIR="$ROOT_DIR" \
 python3 <<'PY'
 import json
 import os
@@ -276,6 +277,27 @@ if missing:
 
 # App Platform must reach the process through the container network.
 env["RELAYER_BIND"] = "0.0.0.0:8080"
+
+# Durability of the signed notary-operator manifest: this script
+# regenerates the ENTIRE app spec from the env file, so any env var
+# upserted out-of-band (specifically RELAYER_OPERATOR_MANIFEST, set by
+# .github/workflows/sign-manifest.yml) would be silently dropped by the
+# next ordinary deploy — /manifest.json would revert to 404 and every
+# client that pinned the manifest hash would break. The Dockerfile
+# bakes manifest-signed/ into the image at /srv/operator-manifest/, so
+# whenever the checkout being built carries the signed bytes, wire the
+# service to them here too. Conditional on the file existing: an image
+# built from a pre-signing checkout must NOT get the env var, because
+# the relayer refuses to boot (crash loop) when it points at a missing
+# file. setdefault keeps any explicit value from the env file
+# (including an explicit empty value, which disables the endpoint).
+manifest_signed = os.path.join(
+    os.environ["ROOT_DIR"], "manifest-signed", "manifest.json"
+)
+if os.path.exists(manifest_signed):
+    env.setdefault(
+        "RELAYER_OPERATOR_MANIFEST", "/srv/operator-manifest/manifest.json"
+    )
 
 envs = []
 for key in sorted(k for k in env if k.startswith("RELAYER_")):

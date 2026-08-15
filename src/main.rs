@@ -20,6 +20,16 @@ use validation::RateLimiter;
 
 #[tokio::main]
 async fn main() {
+    // CI helper: `onym-relayer verify-operator-manifest <manifest> [<sig>]`
+    // verifies a signed manifest file with the SAME code that gates boot
+    // below (sign-manifest.yml runs it on the freshly signed bytes before
+    // committing or deploying them). Handled before Config::from_env —
+    // it needs no relayer configuration.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("verify-operator-manifest") {
+        std::process::exit(run_verify_operator_manifest(&args[2..]));
+    }
+
     let mut config = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -192,15 +202,36 @@ async fn main() {
     // The signed notary-operator manifest, when this deployment
     // publishes one. Boot fails on an invalid or mis-keyed manifest —
     // serving bytes whose signature does not verify against their own
-    // operator key would poison every client that pins them.
-    let operator_manifest = match std::env::var("RELAYER_OPERATOR_MANIFEST") {
-        Err(_) => None,
-        Ok(path) => match operator_manifest::load_and_verify(std::path::Path::new(&path)) {
+    // operator key would poison every client that pins them. An
+    // EXPIRED (but correctly signed) manifest deliberately does NOT
+    // kill the relayer: expiry is a date lapse, not corruption, and
+    // exiting would turn a missed re-signing into a full transaction
+    // outage. Instead the manifest endpoints 404 with an explicit
+    // "re-sign required" body while transactions keep flowing.
+    let operator_manifest = match operator_manifest_env(std::env::var("RELAYER_OPERATOR_MANIFEST"))
+    {
+        None => handler::OperatorManifestState::Absent,
+        Some(path) => match operator_manifest::load_and_verify(std::path::Path::new(&path)) {
             Ok(manifest) => {
                 eprintln!("Operator manifest: {path} ({})", manifest.operator);
-                Some(manifest)
+                handler::OperatorManifestState::Published(manifest)
             }
-            Err(error) => {
+            Err(operator_manifest::LoadError::Expired { valid_until }) => {
+                eprintln!(
+                    "========================================================================"
+                );
+                eprintln!("WARNING: operator manifest at {path} EXPIRED at {valid_until}.");
+                eprintln!("The relayer is booting anyway and will keep serving transactions,");
+                eprintln!("but /manifest.json and /manifest.json.sig return 404 (\"expired —");
+                eprintln!("re-sign required\") until the manifest is re-signed: bump validUntil");
+                eprintln!("in operator-manifest.src.json and dispatch the sign-manifest");
+                eprintln!("workflow. Clients reject expired manifests — act now.");
+                eprintln!(
+                    "========================================================================"
+                );
+                handler::OperatorManifestState::Expired
+            }
+            Err(error @ operator_manifest::LoadError::Invalid(_)) => {
                 eprintln!("Invalid operator manifest at {path}: {error}");
                 std::process::exit(1);
             }
@@ -244,6 +275,87 @@ async fn main() {
         .await
         .expect("failed to bind");
     axum::serve(listener, app).await.expect("server error");
+}
+
+/// Interpret the `RELAYER_OPERATOR_MANIFEST` environment value, with a
+/// blank (or whitespace-only) value meaning "unset". Sourced env files
+/// (`run.sh` does `set -a; . .env`; onym-infra's relayer.env is sourced
+/// the same way) export a `RELAYER_OPERATOR_MANIFEST=` line as an empty
+/// string, and treating "" as a real path would exit(1) at boot — a
+/// crash loop under a supervisor. `.env.example` documents "explicitly
+/// empty, to disable"; this makes the code match.
+fn operator_manifest_env(value: Result<String, std::env::VarError>) -> Option<String> {
+    match value {
+        Err(_) => None,
+        Ok(p) if p.trim().is_empty() => None,
+        Ok(p) => Some(p),
+    }
+}
+
+/// `verify-operator-manifest <manifest> [<detached-sig>]`: exit 0 when
+/// the file passes the boot-path verifier (and, when given, the
+/// detached signature file agrees with the embedded signature), nonzero
+/// otherwise. Used by .github/workflows/sign-manifest.yml to validate
+/// the signer's output in the job that produced it. The pinned
+/// onym-discovery CLI cannot do this: its `verify manifest` checks the
+/// *discovery provider* schema (seat "discovery") and rejects this
+/// notary-seat manifest by design.
+fn run_verify_operator_manifest(args: &[String]) -> i32 {
+    let (manifest_path, sig_path) = match args {
+        [m] => (m, None),
+        [m, s] => (m, Some(std::path::Path::new(s))),
+        _ => {
+            eprintln!("usage: onym-relayer verify-operator-manifest <manifest> [<detached-sig>]");
+            return 2;
+        }
+    };
+    match operator_manifest::verify_file(std::path::Path::new(manifest_path), sig_path) {
+        Ok(manifest) => {
+            eprintln!("OK: {manifest_path} verifies ({})", manifest.operator);
+            0
+        }
+        Err(error) => {
+            eprintln!("Invalid operator manifest at {manifest_path}: {error}");
+            1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::operator_manifest_env;
+
+    #[test]
+    fn blank_operator_manifest_env_means_unset() {
+        // Sourced env files (run.sh's `set -a; . .env`, onym-infra's
+        // relayer.env) export `RELAYER_OPERATOR_MANIFEST=` as "" — that
+        // must disable the manifest, not crash-loop on path "".
+        assert_eq!(operator_manifest_env(Ok(String::new())), None);
+        assert_eq!(operator_manifest_env(Ok("  \t\n".to_string())), None);
+    }
+
+    #[test]
+    fn unset_operator_manifest_env_means_unset() {
+        assert_eq!(
+            operator_manifest_env(Err(std::env::VarError::NotPresent)),
+            None
+        );
+    }
+
+    #[test]
+    fn real_operator_manifest_path_passes_through_verbatim() {
+        assert_eq!(
+            operator_manifest_env(Ok("/srv/operator-manifest/manifest.json".to_string())),
+            Some("/srv/operator-manifest/manifest.json".to_string())
+        );
+        // No trimming of a non-blank value: a path with surrounding
+        // whitespace is the operator's mistake to see verbatim in the
+        // boot error, not ours to guess at.
+        assert_eq!(
+            operator_manifest_env(Ok(" /x ".to_string())),
+            Some(" /x ".to_string())
+        );
+    }
 }
 
 /// Try the manifest URL once at boot. Falls back to the disk cache on

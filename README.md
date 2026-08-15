@@ -201,6 +201,156 @@ The apps seed a hardcoded default at first launch (offline-proof), then refresh
 from these manifests in the background; a user's own custom entries are never
 overwritten, and "Restore default" re-fetches the published list.
 
+## Operator manifest signing (notary seat)
+
+The relayer is a declared notary-seat operator
+(`onym-system/notary/UI-Notary-BNB.md` §8): it serves a signed
+operator manifest byte-for-byte at `GET /manifest.json`, and group
+bindings and entitlements pin the SHA-256 of exactly those bytes.
+
+The pieces:
+
+- `operator-manifest.src.json` — the unsigned manifest source
+  (component id, declared powers, networks, offers, `validUntil`).
+  Changing terms means editing this file and re-running the signing
+  workflow: a new manifest version and hash, never an edit in place.
+  `validUntil` is enforced in three places: CI warns/fails while
+  there is still time to re-sign, the signing workflow refuses to
+  sign an already-expired src (via the boot-path verifier), and the
+  relayer itself **refuses to boot** on an expired manifest — the
+  last one matters because deploy paths like the onym-infra droplet
+  never pass through this repo's CI.
+  The `networks[].submitterAccount` entries declare the fee-payer
+  account per network, and each one must **exist (be funded) on its
+  network** before signing — an unfunded fee-payer means every
+  relayed transaction on that network fails, while the signed
+  manifest (whose hash clients pin, immutably) keeps promising it
+  works. `scripts/check-manifest-funding.sh` checks exactly this
+  against each network's Horizon; it runs as a hard pre-signing gate
+  in the sign-manifest workflow and as a CI tripwire (warn on PRs,
+  fail on pushes to `main` — accounts are funded, and can be emptied,
+  independently of any PR).
+
+  **v1 declares testnet only.** The mainnet (`public`) entry was
+  deliberately dropped: the fee-payer account is not funded on
+  mainnet yet, and signing would bake a nonexistent account into an
+  immutable commitment. Mainnet support rides a re-sign — once the
+  account is funded on mainnet, add the `public` entry back to this
+  file and dispatch sign-manifest: a new manifest version and hash
+  that clients pin fresh, which is safer than blocking today's
+  testnet dispatch on mainnet funding.
+
+  ```sh
+  # Testnet: friendbot creates and funds the account (no-op error if
+  # it already exists — that is fine).
+  curl -sS "https://friendbot.stellar.org/?addr=<G...>"
+
+  # Either network: Horizon returns the account record when it exists
+  # and is funded; HTTP 404 means NOT funded on that network.
+  curl -fsS "https://horizon-testnet.stellar.org/accounts/<G...>"
+  curl -fsS "https://horizon.stellar.org/accounts/<G...>"   # public — fund manually first
+  ```
+  `powers.setRestrictedMode: ["manifest-mirror"]` declares that the
+  deployments the operator can restrict are exactly the ones in the
+  contracts manifest it mirrors (same semantics as
+  `allowlistControl`), instead of enumerating contract IDs that churn
+  with every contracts release.
+- `manifest-signed/manifest.json` (+ `.sig`) — the signed bytes,
+  committed to `main` by the workflow so what the service serves is
+  auditable in-repo. The Dockerfile copies `manifest-signed/` to
+  `/srv/operator-manifest/` inside the image;
+  `RELAYER_OPERATOR_MANIFEST=/srv/operator-manifest/manifest.json`
+  wires the service to it.
+- `.github/workflows/sign-manifest.yml` — manual dispatch (type
+  `sign-and-deploy` in the confirm input, on `main`): builds the
+  `onym-discovery` CLI from source at a pinned revision
+  (`PINNED_SIGNER_REV` in the workflow — never a floating branch, and
+  never a cached binary, since the job holds the signing seed),
+  signs with the `RELAYER_OPERATOR_SEED` secret,
+  commits the signed bytes to `main`, redeploys, and verifies that
+  `https://relayer.onym.app/manifest.json` serves the committed bytes
+  stably (two fetches, both SHA-256-equal to the committed file). The
+  operator id and fingerprint are printed in the job summary for
+  out-of-band publication — and must also be copied over
+  `REPLACE-RELAYER-KEY` in onym-discovery's
+  `deploy/onym/catalogs/onym-services.config.json`, which is what the
+  Discovery catalog pins.
+
+### The `RELAYER_OPERATOR_SEED` secret
+
+Generate the seed **offline**, not in CI:
+
+```sh
+cargo install --git https://github.com/onymchat/onym-discovery --locked
+onym-discovery keygen --out relayer-operator.seed
+```
+
+- The secret value is the file's contents: 64 hex characters.
+- Keep `relayer-operator.seed` offline as the custody copy.
+- Publish the printed fingerprint out of band (site, announcement) so
+  clients can check what they pin.
+- **No rotation in v1.** A lost or replaced key is a *new* operator:
+  existing bindings keep verifying against the old manifest bytes
+  forever, but clients must re-pin to trust anything new. The workflow
+  enforces this by failing when the seed no longer matches the
+  operator key committed in `operator-manifest.src.json`.
+
+### Environment protection (recommended)
+
+The workflow runs in the `production` environment. GitHub
+auto-creates that environment **unprotected** on first dispatch, so
+before the first run: repo Settings → Environments → `production` →
+add required reviewers, and scope `RELAYER_OPERATOR_SEED` to that
+environment. Then every signing run waits for an approval before the
+seed is exposed to the job.
+
+Related caveat — **branch protection on `main`**: the workflow commits
+the signed bytes and pushes them to `main` with the default
+`GITHUB_TOKEN`. A branch-protection rule (or ruleset) on `main` that
+blocks direct pushes makes that push fail *after* signing has already
+happened — the run dies with the signed bytes stranded in the runner's
+workspace. If you protect `main`, either add a bypass for
+`github-actions[bot]` (rulesets support bypass actors) or expect to
+rework the commit step into a PR-based flow (open a PR with the signed
+bytes and gate the deploy/verify steps on its merge).
+
+### Deploy paths
+
+- **App Platform** (default; `scripts/deploy-digitalocean.sh`
+  conventions, org-level `DO_API_KEY` secret): the workflow ensures
+  `RELAYER_OPERATOR_MANIFEST` in the app spec (waiting on that
+  deployment), then pushes a fresh image to DOCR — `deploy_on_push`
+  deploys it against the updated spec — and verifies strictly.
+  Ordinary redeploys stay safe afterwards:
+  `scripts/deploy-digitalocean.sh` regenerates the whole spec from the
+  env file, and it re-adds `RELAYER_OPERATOR_MANIFEST` on its own
+  whenever `manifest-signed/manifest.json` exists in the checkout, so
+  a routine deploy cannot silently drop the var and revert
+  `/manifest.json` to 404.
+- **onym-infra droplet** (where `relayer.onym.app` currently runs;
+  the relayer is a git submodule of the compose stack): dispatch with
+  `skip_deploy=true`, then follow these steps **in this order** —
+  the order matters, because the relayer exits at boot
+  (`std::process::exit(1)` in `src/main.rs`) when
+  `RELAYER_OPERATOR_MANIFEST` points at a file that does not exist or
+  does not verify. Setting the env var before the image contains
+  `manifest-signed/manifest.json` puts the container in a crash loop.
+
+  1. Dispatch `sign-manifest` with `skip_deploy=true`; it commits the
+     signed bytes to `main` (the byte check will only *warn* — the
+     droplet has not picked the commit up yet).
+  2. **First**, in onym-infra: bump the `relayer` submodule to that
+     signing commit (so the image built from it actually contains
+     `/srv/operator-manifest/manifest.json`).
+  3. **Only then** set
+     `RELAYER_OPERATOR_MANIFEST=/srv/operator-manifest/manifest.json`
+     in `relayer.env`. Do these two in one onym-infra commit if you
+     like — what must never happen is deploying the env var against
+     an image built from a pre-signing submodule rev.
+  4. Deploy onym-infra.
+  5. Re-run `sign-manifest` with `skip_deploy=true` for a green
+     byte-for-byte verification of the served manifest.
+
 ## API
 
 The service accepts `POST /` requests with:
