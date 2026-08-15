@@ -2,7 +2,7 @@
   "version": 1,
   "componentId": "onym:component:onym-relayer",
   "seat": "notary",
-  "operator": "onym:key:REPLACE-OPERATOR-KEY",
+  "operator": "onym:key:8c836293161a3ee2e4c2e338851d88289a2db494efc6342d9fb7ac0c516936ad",
   "implementationProfiles": [
     "onym:notary-implementation:stellar-soroban-sep-plonk-v1"
   ],
@@ -16,7 +16,9 @@
   ],
   "powers": {
     "gateCreation": true,
-    "setRestrictedMode": ["manifest-mirror"],
+    "setRestrictedMode": [
+      "manifest-mirror"
+    ],
     "allowlistControl": "manifest-mirror",
     "canAuthorTransitions": false,
     "canRewriteState": false,
