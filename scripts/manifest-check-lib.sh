@@ -1,4 +1,7 @@
+# shellcheck shell=bash
 # Shared warn/fail plumbing for the operator-manifest tripwire scripts
+# (bash: the deferred-problem list below uses arrays; every sourcing
+# script already runs under #!/usr/bin/env bash).
 # (check-manifest-drift.sh, check-manifest-expiry.sh,
 # check-manifest-funding.sh). Sourced, not executed — so the mode
 # handling cannot drift between the scripts.
@@ -39,5 +42,33 @@ problem() {
     exit 0
   fi
   printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+# Deferred variant for scripts that check several independent items
+# (the funding script's networks[] loop): note_problem records instead
+# of exiting, so ONE bad network does not hide the state of the rest —
+# report_problems then emits every finding at once and exits with the
+# same warn/fail semantics as problem(). A single run tells the whole
+# story instead of one finding per re-run.
+problem_list=()
+
+note_problem() {
+  problem_list+=("$*")
+}
+
+report_problems() {
+  if [ "${#problem_list[@]}" -eq 0 ]; then
+    return 0
+  fi
+  if [ "$mode" = warn ]; then
+    for entry in "${problem_list[@]}"; do
+      echo "::warning::$entry"
+    done
+    exit 0
+  fi
+  for entry in "${problem_list[@]}"; do
+    printf 'FAIL: %s\n' "$entry" >&2
+  done
   exit 1
 }

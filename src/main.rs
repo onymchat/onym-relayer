@@ -202,16 +202,36 @@ async fn main() {
     // The signed notary-operator manifest, when this deployment
     // publishes one. Boot fails on an invalid or mis-keyed manifest —
     // serving bytes whose signature does not verify against their own
-    // operator key would poison every client that pins them.
+    // operator key would poison every client that pins them. An
+    // EXPIRED (but correctly signed) manifest deliberately does NOT
+    // kill the relayer: expiry is a date lapse, not corruption, and
+    // exiting would turn a missed re-signing into a full transaction
+    // outage. Instead the manifest endpoints 404 with an explicit
+    // "re-sign required" body while transactions keep flowing.
     let operator_manifest = match operator_manifest_env(std::env::var("RELAYER_OPERATOR_MANIFEST"))
     {
-        None => None,
+        None => handler::OperatorManifestState::Absent,
         Some(path) => match operator_manifest::load_and_verify(std::path::Path::new(&path)) {
             Ok(manifest) => {
                 eprintln!("Operator manifest: {path} ({})", manifest.operator);
-                Some(manifest)
+                handler::OperatorManifestState::Published(manifest)
             }
-            Err(error) => {
+            Err(operator_manifest::LoadError::Expired { valid_until }) => {
+                eprintln!(
+                    "========================================================================"
+                );
+                eprintln!("WARNING: operator manifest at {path} EXPIRED at {valid_until}.");
+                eprintln!("The relayer is booting anyway and will keep serving transactions,");
+                eprintln!("but /manifest.json and /manifest.json.sig return 404 (\"expired —");
+                eprintln!("re-sign required\") until the manifest is re-signed: bump validUntil");
+                eprintln!("in operator-manifest.src.json and dispatch the sign-manifest");
+                eprintln!("workflow. Clients reject expired manifests — act now.");
+                eprintln!(
+                    "========================================================================"
+                );
+                handler::OperatorManifestState::Expired
+            }
+            Err(error @ operator_manifest::LoadError::Invalid(_)) => {
                 eprintln!("Invalid operator manifest at {path}: {error}");
                 std::process::exit(1);
             }

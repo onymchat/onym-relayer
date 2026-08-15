@@ -17,25 +17,39 @@ name: CI
 #     promising it works. Accounts are funded (and can be emptied)
 #     independently of any PR, which is why this also runs on push.
 #
-# All three warn (::warning::) instead of failing on pull_request: each
-# flags a state of main that the PR author cannot fix from the PR —
-# expiry and funding are fixed by dispatching sign-manifest / funding
-# the account, and drift is red BY DESIGN on the very PR that remedies
-# it (sign-manifest re-aligns the signed bytes only after merge). Push
-# to main hard-fails, where the people who can act see it. The mode
-# plumbing lives once in scripts/manifest-check-lib.sh.
+# All three warn (::warning::) instead of failing on pull_request — as
+# does the boot-path verifier step below: each flags a state of main
+# that the PR author cannot fix from the PR — expiry and funding are
+# fixed by dispatching sign-manifest / funding the account, and drift
+# is red BY DESIGN on the very PR that remedies it (sign-manifest
+# re-aligns the signed bytes only after merge). Push to main
+# hard-fails, where the people who can act see it. The mode plumbing
+# lives once in scripts/manifest-check-lib.sh.
+#
+# The weekly `schedule` run exists for the expiry tripwire: validUntil
+# marches toward the deadline with or without repo activity, and a
+# quiet repo must still get the red run (and its notification email)
+# while there is time to re-sign. Scheduled runs hard-fail like push.
 
 on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # Weekly (Mondays 06:00 UTC): the expiry tripwire must fire even
+    # when nobody pushes. Hard-fail mode, so the failure email lands.
+    - cron: '0 6 * * 1'
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs only for PRs (new push obsoletes the old
+  # run). Push-to-main and scheduled runs must each complete: they are
+  # the hard-fail tripwire runs, and cancelling one silently loses the
+  # red signal it exists to produce.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -66,19 +80,33 @@ jobs:
       # Once the manifest has been signed, run the signed bytes through
       # the relayer's own boot-path verifier (the exact code that
       # accepts or refuses them in production) so a bad signed artifact
-      # is red on every PR and push, not only at the next deploy.
+      # is red on push and schedule, not only at the next deploy.
+      # Warn-only on pull_request, like the tripwires below: the
+      # verifier also fails on an EXPIRED committed manifest, which is
+      # a state of main no PR author can fix — it must not red every
+      # unrelated PR while sign-manifest is being dispatched.
       - name: Verify signed manifest with the boot-path verifier
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ -f manifest-signed/manifest.json ]; then
-            cargo run -q -- verify-operator-manifest \
-              manifest-signed/manifest.json manifest-signed/manifest.json.sig
-          else
+          if [ ! -f manifest-signed/manifest.json ]; then
             echo 'No manifest-signed/manifest.json yet — skipping.'
+            exit 0
           fi
+          if cargo run -q -- verify-operator-manifest \
+              manifest-signed/manifest.json manifest-signed/manifest.json.sig; then
+            exit 0
+          fi
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo '::warning::The boot-path verifier refused manifest-signed/manifest.json (see the log above — likely an expired validUntil). This is a state of main, not of this PR: dispatch sign-manifest with a bumped validUntil. Hard-fails on push to main and on the weekly schedule.'
+            exit 0
+          fi
+          exit 1
 
       # The tripwires (shared scripts; see each header for what it
       # catches and what it deliberately does not). Warn-only on PRs,
-      # hard fail on push to main — see the workflow header comment.
+      # hard fail on push to main and on schedule — see the workflow
+      # header comment.
       - name: Tripwire mode
         id: mode
         run: |

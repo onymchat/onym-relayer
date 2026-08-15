@@ -47,23 +47,38 @@ fi
 NS_TESTNET=cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472
 NS_PUBLIC=7ac33997544e3175d266bd022439b22cdb16508c01163f26e5cb2a3e1045a979
 
+# A manifest without a networks ARRAY must FAIL, not vacuously pass:
+# `.networks | length` on a missing key is 0, which would wave through
+# a manifest that promises nothing checkable — precisely the shape a
+# typo ("Networks", a string value) produces. An explicit empty array
+# is a declared choice and still passes below.
+networks_type="$(jq -r '.networks | type' "$manifest")"
+if [ "$networks_type" != "array" ]; then
+  problem "$manifest: .networks is $networks_type, expected an array — the funding gate cannot verify fee-payers on a manifest without networks[]; declare the array (empty is allowed, but explicit)."
+fi
+
 count="$(jq '.networks | length' "$manifest")"
 if [ "$count" -eq 0 ]; then
-  echo "$manifest declares no networks[] entries — nothing to check."
+  echo "$manifest declares an explicitly empty networks[] — nothing to check."
   exit 0
 fi
 
+# Per-network findings are DEFERRED (note_problem) and reported all at
+# once after the loop: one broken network must not hide the state of
+# the others behind a first-failure exit.
 for i in $(seq 0 $((count - 1))); do
   entry="$(jq -c ".networks[$i]" "$manifest")"
   namespace="$(jq -r '.namespace // empty' <<<"$entry")"
   network="$(jq -r '.network // empty' <<<"$entry")"
   account="$(jq -r '.submitterAccount // empty' <<<"$entry")"
   if [ -z "$account" ]; then
-    problem "networks[$i] in $manifest has no submitterAccount."
+    note_problem "networks[$i] in $manifest has no submitterAccount."
+    continue
   fi
   # Resolve the Horizon for the entry — by namespace hash first (the
   # normative field), by network name as a fallback; refuse rather
   # than guess when neither is recognized.
+  horizon=""
   case "$namespace" in
     "stellar:$NS_TESTNET") horizon=https://horizon-testnet.stellar.org ;;
     "stellar:$NS_PUBLIC") horizon=https://horizon.stellar.org ;;
@@ -71,10 +86,13 @@ for i in $(seq 0 $((count - 1))); do
       case "$network" in
         testnet) horizon=https://horizon-testnet.stellar.org ;;
         public) horizon=https://horizon.stellar.org ;;
-        *) problem "networks[$i] in $manifest: unrecognized namespace '$namespace' / network '$network' — cannot pick a Horizon to verify the fee-payer against." ;;
+        *) note_problem "networks[$i] in $manifest: unrecognized namespace '$namespace' / network '$network' — cannot pick a Horizon to verify the fee-payer against." ;;
       esac
       ;;
   esac
+  if [ -z "$horizon" ]; then
+    continue
+  fi
   status="$(curl -sS -o /dev/null -w '%{http_code}' \
     --max-time 30 "$horizon/accounts/$account" || echo 000)"
   case "$status" in
@@ -82,10 +100,12 @@ for i in $(seq 0 $((count - 1))); do
       echo "OK: networks[$i] ($network) submitterAccount $account exists on $horizon."
       ;;
     404)
-      problem "networks[$i] ($network) submitterAccount $account does NOT exist on $horizon (HTTP 404) — an unfunded fee-payer means every relayed transaction on that network fails. Fund the account (testnet: friendbot; public: real XLM above base reserve), or remove the entry, before the manifest is (re-)signed."
+      note_problem "networks[$i] ($network) submitterAccount $account does NOT exist on $horizon (HTTP 404) — an unfunded fee-payer means every relayed transaction on that network fails. Fund the account (testnet: friendbot; public: real XLM above base reserve), or remove the entry, before the manifest is (re-)signed."
       ;;
     *)
-      problem "networks[$i] ($network): Horizon $horizon returned HTTP $status for $account — cannot verify the fee-payer exists."
+      note_problem "networks[$i] ($network): Horizon $horizon returned HTTP $status for $account — cannot verify the fee-payer exists."
       ;;
   esac
 done
+
+report_problems

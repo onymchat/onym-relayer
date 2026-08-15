@@ -20,6 +20,37 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::Value;
 
+/// Why a manifest failed to load. The split is the whole point:
+/// `Expired` means the bytes are authentic (the signature verifies
+/// against the embedded operator key) but `validUntil` has passed —
+/// the relayer keeps serving transactions and only degrades the
+/// manifest endpoints, because killing the relayer on a *date* would
+/// turn every lapsed re-signing into a full transaction outage.
+/// `Invalid` means corruption (bad signature, wrong seat, malformed
+/// fields …) and refuses boot: serving unverifiable bytes would
+/// poison every client that pins them.
+#[derive(Debug)]
+pub enum LoadError {
+    /// Signature verifies, but `validUntil` is in the past.
+    Expired { valid_until: String },
+    /// Anything else — the manifest cannot be trusted at all.
+    Invalid(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Expired { valid_until } => write!(
+                f,
+                "manifest EXPIRED: validUntil {valid_until} is in the past — clients \
+                 reject expired manifests; bump validUntil in operator-manifest.src.json \
+                 and re-run the sign-manifest workflow"
+            ),
+            LoadError::Invalid(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Verified manifest state held for the lifetime of the process.
 #[derive(Debug)]
 pub struct OperatorManifest {
@@ -33,7 +64,25 @@ pub struct OperatorManifest {
     pub operator: String,
 }
 
-pub fn load_and_verify(path: &std::path::Path) -> Result<OperatorManifest, String> {
+pub fn load_and_verify(path: &std::path::Path) -> Result<OperatorManifest, LoadError> {
+    // Structural + signature checks first: only a manifest whose
+    // signature already verifies can earn the softer `Expired` outcome.
+    // An expired AND tampered manifest is corruption, not lapse.
+    let (manifest, valid_until, until) =
+        verify_structure_and_signature(path).map_err(LoadError::Invalid)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| LoadError::Invalid(format!("system clock before epoch: {e}")))?
+        .as_secs() as i64;
+    if until <= now {
+        return Err(LoadError::Expired { valid_until });
+    }
+    Ok(manifest)
+}
+
+fn verify_structure_and_signature(
+    path: &std::path::Path,
+) -> Result<(OperatorManifest, String, i64), String> {
     let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let value: Value =
         serde_json::from_slice(&raw).map_err(|e| format!("manifest is not valid JSON: {e}"))?;
@@ -83,27 +132,17 @@ pub fn load_and_verify(path: &std::path::Path) -> Result<OperatorManifest, Strin
         .try_into()
         .map_err(|_| "signature must be 64 bytes".to_string())?;
 
-    // Expiry: clients REJECT expired manifests, so serving one only
-    // poisons pinning clients. Refusing to boot puts the check where
-    // the bytes are actually served — CI tripwires cover the repo, but
-    // the onym-infra droplet path deploys with no CI in front of it.
+    // Expiry material: a missing or malformed validUntil is corruption
+    // (`Invalid`); the actual past/future comparison lives in
+    // `load_and_verify`, AFTER the signature verifies, so only an
+    // authentic manifest can be merely `Expired`.
     let valid_until = object
         .get("validUntil")
         .and_then(Value::as_str)
-        .ok_or("manifest must declare validUntil")?;
+        .ok_or("manifest must declare validUntil")?
+        .to_string();
     let until =
-        parse_rfc3339_utc(valid_until).map_err(|e| format!("validUntil {valid_until:?}: {e}"))?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("system clock before epoch: {e}"))?
-        .as_secs() as i64;
-    if until <= now {
-        return Err(format!(
-            "manifest EXPIRED: validUntil {valid_until} is in the past — clients \
-             reject expired manifests; bump validUntil in operator-manifest.src.json \
-             and re-run the sign-manifest workflow"
-        ));
-    }
+        parse_rfc3339_utc(&valid_until).map_err(|e| format!("validUntil {valid_until:?}: {e}"))?;
 
     // Canonical signing bytes: structural removal, sorted keys.
     let mut unsigned = value.clone();
@@ -116,11 +155,15 @@ pub fn load_and_verify(path: &std::path::Path) -> Result<OperatorManifest, Strin
         .verify(&canonical, &Signature::from_bytes(&signature_bytes))
         .map_err(|_| "manifest signature does not verify against its operator key".to_string())?;
 
-    Ok(OperatorManifest {
-        raw,
-        detached_signature: signature_b64,
-        operator,
-    })
+    Ok((
+        OperatorManifest {
+            raw,
+            detached_signature: signature_b64,
+            operator,
+        },
+        valid_until,
+        until,
+    ))
 }
 
 /// Parse an RFC 3339 timestamp (`2027-08-14T00:00:00Z`, fractional
@@ -135,7 +178,11 @@ fn parse_rfc3339_utc(s: &str) -> Result<i64, String> {
             .get(range.clone())
             .ok_or_else(|| format!("truncated at byte {}", range.start))?;
         if !part.iter().all(u8::is_ascii_digit) {
-            return Err(format!("non-digit in {:?}", &s[range]));
+            // from_utf8_lossy, never `&s[range]`: a byte range can land
+            // mid-character on non-ASCII input, and slicing the &str
+            // there PANICS — in an error path that runs before the
+            // signature has even been checked.
+            return Err(format!("non-digit in {:?}", String::from_utf8_lossy(part)));
         }
         Ok(std::str::from_utf8(part).unwrap().parse().unwrap())
     };
@@ -156,13 +203,31 @@ fn parse_rfc3339_utc(s: &str) -> Result<i64, String> {
     let (hour, minute, second) = (digits(11..13)?, digits(14..16)?, digits(17..19)?);
     sep(13, b":")?;
     sep(16, b":")?;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
+    // second == 60 (a leap second) is valid RFC 3339, but we reject it
+    // on purpose: this parses a boot gate's expiry date, strictness
+    // beats cleverness, and no sane signing tool emits :60 in a
+    // manifest expiry. Accepting it would trade a clear refusal for a
+    // once-a-decade edge case nobody exercises.
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
         return Err("date/time component out of range".into());
+    }
+    // Real calendar days only: Feb 30 or Apr 31 in a validUntil is a
+    // typo that must be refused, not silently normalized into some
+    // other date by the days-from-civil arithmetic below.
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return Err(format!("day {day} out of range for month {month}"));
     }
 
     // Fractional seconds are ignored (sub-second expiry precision is
@@ -212,7 +277,11 @@ pub fn verify_file(
     path: &std::path::Path,
     sig_path: Option<&std::path::Path>,
 ) -> Result<OperatorManifest, String> {
-    let manifest = load_and_verify(path)?;
+    // The CLI/CI caller flattens `Expired` back into a failure on
+    // purpose: `verify-operator-manifest` gates signing and scheduled
+    // CI, where an expired manifest must be red — the boots-anyway
+    // leniency belongs only to the serving process (main.rs).
+    let manifest = load_and_verify(path).map_err(|e| e.to_string())?;
     if let Some(sig_path) = sig_path {
         let detached = std::fs::read_to_string(sig_path)
             .map_err(|e| format!("read {}: {e}", sig_path.display()))?;
@@ -287,7 +356,8 @@ mod tests {
         let bytes = signed_manifest("notary", true);
         let path = write_temp("tampered", &bytes);
         let err = load_and_verify(&path).unwrap_err();
-        assert!(err.contains("does not verify"), "{err}");
+        assert!(matches!(err, LoadError::Invalid(_)), "{err:?}");
+        assert!(err.to_string().contains("does not verify"), "{err}");
         std::fs::remove_file(path).ok();
     }
 
@@ -316,11 +386,30 @@ mod tests {
     }
 
     #[test]
-    fn expired_manifest_refused_at_boot() {
+    fn expired_manifest_is_the_distinct_expired_outcome() {
+        // Expired-but-authentic is NOT corruption: main.rs boots the
+        // relayer and degrades only the manifest endpoints on this
+        // variant, so it must be distinguishable from Invalid.
         let bytes = signed_manifest_at("notary", false, "2020-01-01T00:00:00Z");
         let path = write_temp("expired", &bytes);
         let err = load_and_verify(&path).unwrap_err();
-        assert!(err.contains("EXPIRED"), "{err}");
+        assert!(
+            matches!(&err, LoadError::Expired { valid_until } if valid_until == "2020-01-01T00:00:00Z"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("EXPIRED"), "{err}");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn expired_and_tampered_is_invalid_not_expired() {
+        // The Expired leniency is only for authentic bytes: the
+        // signature is checked BEFORE the date, so an expired manifest
+        // with a broken signature is corruption and refuses boot.
+        let bytes = signed_manifest_at("notary", true, "2020-01-01T00:00:00Z");
+        let path = write_temp("expired-tampered", &bytes);
+        let err = load_and_verify(&path).unwrap_err();
+        assert!(matches!(err, LoadError::Invalid(_)), "{err:?}");
         std::fs::remove_file(path).ok();
     }
 
@@ -345,9 +434,55 @@ mod tests {
             let bytes = signed_manifest_at("notary", false, bad);
             let path = write_temp("malformed", &bytes);
             let err = load_and_verify(&path).unwrap_err();
-            assert!(err.contains("validUntil"), "{bad}: {err}");
+            assert!(matches!(err, LoadError::Invalid(_)), "{bad}: {err:?}");
+            assert!(err.to_string().contains("validUntil"), "{bad}: {err}");
             std::fs::remove_file(path).ok();
         }
+    }
+
+    #[test]
+    fn non_ascii_valid_until_errors_cleanly_instead_of_panicking() {
+        // Regression: the error path used `&s[range]` on the input
+        // string; a byte range ending mid-character on non-ASCII input
+        // panicked before the signature was even checked. It must be a
+        // clean Invalid error instead.
+        for bad in ["203é-01-01T00:00:00Z", "２０３０-01-01T00:00:00Z"] {
+            let parse_err = parse_rfc3339_utc(bad).unwrap_err();
+            assert!(parse_err.contains("non-digit"), "{bad}: {parse_err}");
+            let bytes = signed_manifest_at("notary", false, bad);
+            let path = write_temp("non-ascii", &bytes);
+            let err = load_and_verify(&path).unwrap_err();
+            assert!(matches!(err, LoadError::Invalid(_)), "{bad}: {err:?}");
+            assert!(err.to_string().contains("validUntil"), "{bad}: {err}");
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn impossible_calendar_dates_refused() {
+        for bad in [
+            "2030-02-30T00:00:00Z",
+            "2030-02-31T00:00:00Z",
+            "2030-04-31T00:00:00Z",
+            "2030-06-31T00:00:00Z",
+            "2029-02-29T00:00:00Z", // 2029 is not a leap year
+            "2100-02-29T00:00:00Z", // century rule: 2100 is not a leap year
+            "2030-01-00T00:00:00Z",
+            "2030-01-32T00:00:00Z",
+        ] {
+            assert!(parse_rfc3339_utc(bad).is_err(), "{bad:?} should not parse");
+        }
+        // Real leap days parse (2028: /4 rule; 2000: /400 rule).
+        assert!(parse_rfc3339_utc("2028-02-29T00:00:00Z").is_ok());
+        assert!(parse_rfc3339_utc("2000-02-29T00:00:00Z").is_ok());
+    }
+
+    #[test]
+    fn leap_second_refused_by_choice() {
+        // second == 60 is valid RFC 3339; the parser rejects it on
+        // purpose (strict boot gate — see the comment in the parser).
+        assert!(parse_rfc3339_utc("2030-06-30T23:59:60Z").is_err());
+        assert!(parse_rfc3339_utc("2030-06-30T23:59:59Z").is_ok());
     }
 
     #[test]
@@ -371,7 +506,8 @@ mod tests {
             .insert("signature".into(), Value::String(sig_b64));
         let path = write_temp("no-validuntil", &serde_json::to_vec(&doc).unwrap());
         let err = load_and_verify(&path).unwrap_err();
-        assert!(err.contains("validUntil"), "{err}");
+        assert!(matches!(err, LoadError::Invalid(_)), "{err:?}");
+        assert!(err.to_string().contains("validUntil"), "{err}");
         std::fs::remove_file(path).ok();
     }
 
@@ -414,7 +550,8 @@ mod tests {
         let bytes = signed_manifest("moderation", false);
         let path = write_temp("wrongseat", &bytes);
         let err = load_and_verify(&path).unwrap_err();
-        assert!(err.contains("seat"), "{err}");
+        assert!(matches!(err, LoadError::Invalid(_)), "{err:?}");
+        assert!(err.to_string().contains("seat"), "{err}");
         std::fs::remove_file(path).ok();
     }
 }

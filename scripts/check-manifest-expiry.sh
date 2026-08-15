@@ -9,10 +9,19 @@
 #
 # Shared by ci.yml and release.yml so the two checks cannot diverge.
 #
-# Usage: check-manifest-expiry.sh [--warn]
-#   --warn  see manifest-check-lib.sh (pull_request mode: expiry is a
-#           state of main, fixed by dispatching sign-manifest there —
-#           a PR author cannot fix it, so it must not gate their PR).
+# Usage: check-manifest-expiry.sh [--warn] [<manifest.json>]
+#   --warn      see manifest-check-lib.sh (pull_request mode: expiry is
+#               a state of main, fixed by dispatching sign-manifest
+#               there — a PR author cannot fix it, so it must not gate
+#               their PR).
+#   <manifest>  file to check; defaults to the committed signed
+#               manifest (manifest-signed/manifest.json). With the
+#               default, a missing file skips (never signed yet); an
+#               EXPLICIT path that is missing is an error — the caller
+#               named bytes it expects to exist (sign-manifest.yml runs
+#               this against $MANIFEST_OUT right after signing, so a
+#               src expiring within the window blocks the commit
+#               instead of tripping CI a week later).
 #
 # Needs GNU date (-d); CI runs on ubuntu-latest.
 set -euo pipefail
@@ -21,15 +30,20 @@ cd "$(dirname "$0")/.."
 
 parse_mode_flag "$@"
 shift "$MODE_ARGS"
-if [ "$#" -ne 0 ]; then
-  echo "usage: $0 [--warn]" >&2
+if [ "$#" -gt 1 ]; then
+  echo "usage: $0 [--warn] [<manifest.json>]" >&2
   exit 2
 fi
 
-signed=manifest-signed/manifest.json
-if [ ! -f "$signed" ]; then
-  echo "No $signed yet (manifest never signed) — skipping validUntil check."
-  exit 0
+signed="${1:-}"
+if [ -z "$signed" ]; then
+  signed=manifest-signed/manifest.json
+  if [ ! -f "$signed" ]; then
+    echo "No $signed yet (manifest never signed) — skipping validUntil check."
+    exit 0
+  fi
+elif [ ! -f "$signed" ]; then
+  problem "no manifest at $signed to check validUntil for."
 fi
 
 valid_until="$(jq -r '.validUntil // empty' "$signed")"

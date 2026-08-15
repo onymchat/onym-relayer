@@ -240,6 +240,14 @@ jobs:
           cargo run --quiet -- verify-operator-manifest \
             "$MANIFEST_OUT" "$MANIFEST_OUT.sig"
 
+      # Expiry gate on the OUTPUT, before it is committed: signing a
+      # src whose validUntil is already inside the 30-day warning
+      # window would sign cleanly here and then trip CI's expiry
+      # tripwire immediately (or worse, lapse before anyone re-signs).
+      # Same shared script as ci.yml, hard-fail mode.
+      - name: Freshly signed manifest must not be near expiry
+        run: scripts/check-manifest-expiry.sh "$MANIFEST_OUT"
+
       - name: Commit signed bytes to main
         id: commit
         run: |
