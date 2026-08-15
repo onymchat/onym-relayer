@@ -14,11 +14,13 @@ name: Sign operator manifest
 # RELAYER_OPERATOR_MANIFEST points the service at it. Because the image
 # is built from the repo, this run MUST be dispatched on main and the
 # signed bytes must land ON main — a signed manifest on a side branch
-# would never reach a deployed image. The commit step tries one direct
-# push (works only if the Actions app has a ruleset bypass); when the
-# main ruleset rejects it (GH013: pull_request required), it falls back
-# to pushing branch signed-manifest/<run_id> and opening a PR, and the
-# deploy/byte-verification steps are skipped until that PR merges.
+# would never reach a deployed image. The commit step retries the
+# direct push a few times for ordinary push races; a ruleset
+# rejection (GH013: pull_request required) is deterministic, so it
+# falls back immediately to pushing branch signed-manifest/<run_id>
+# and opening a PR (closing any stale open signing PR first — newest
+# signing wins), and the deploy/byte-verification steps are skipped
+# until that PR merges.
 #
 # Deploy paths:
 #   * DigitalOcean App Platform (scripts/deploy-digitalocean.sh
@@ -41,6 +43,19 @@ name: Sign operator manifest
 #                          signing" for generation and custody)
 #   DO_API_KEY             org-level DigitalOcean token (only when
 #                          deploying via App Platform)
+#   SIGNING_PR_TOKEN       OPTIONAL: a PAT or GitHub App token
+#                          (contents: write, pull-requests: write).
+#                          When set, the PR fallback creates the
+#                          signing PR with it, so CI RUNS on that PR.
+#                          When absent, the PR is created with the
+#                          default GITHUB_TOKEN — such PRs trigger NO
+#                          workflows (GitHub's recursion guard), so
+#                          they show no checks; verification then
+#                          happens in the post-merge push run on main.
+#                          If the main ruleset ever gains required
+#                          status checks, this secret becomes
+#                          effectively mandatory (a checks-less
+#                          GITHUB_TOKEN PR could never be merged).
 #
 # First run vs later runs: the committed src ships with
 # operator "onym:key:REPLACE-OPERATOR-KEY"; the first run substitutes
@@ -257,7 +272,11 @@ jobs:
       - name: Commit signed bytes to main
         id: commit
         env:
-          GH_TOKEN: ${{ github.token }}
+          # SIGNING_PR_TOKEN (optional PAT/App token) makes CI run on
+          # the fallback PR; with the default github.token, GitHub's
+          # recursion guard means the PR triggers no workflows at all.
+          GH_TOKEN: ${{ secrets.SIGNING_PR_TOKEN || github.token }}
+          PR_TOKEN_MODE: ${{ secrets.SIGNING_PR_TOKEN != '' && 'signing-pr-token' || 'github-token' }}
           OPERATOR: ${{ steps.identity.outputs.operator }}
           FINGERPRINT: ${{ steps.identity.outputs.fingerprint }}
         run: |
@@ -283,56 +302,150 @@ jobs:
             -m 'Signed in CI by the sign-manifest workflow. manifest-signed/manifest.json
           is served byte-for-byte at GET /manifest.json; bindings pin its SHA-256.' \
             -m "Signer: onymchat/onym-discovery@$PINNED_SIGNER_REV (built from source at this pinned rev)"
-          # ONE direct-push attempt: it succeeds only if the Actions app
-          # has (ever gets) a bypass in the main ruleset. Under the
-          # ruleset as configured (pull_request required + linear
-          # history) it fails with GH013 — the PR fallback below
-          # replaces the old retry loop, so a plain push race also
-          # lands in the fallback instead of killing the run with the
-          # signed bytes stranded in the runner's workspace.
-          if git pull --rebase origin main && git push origin HEAD:main; then
+          # Direct push, up to 3 attempts — but only failures that can
+          # heal are retried: a push race (someone landed on main
+          # between our rebase and push) is fixed by the next
+          # rebase+push, while a ruleset rejection (GH013,
+          # pull_request required) is deterministic and retrying it is
+          # futile — that goes straight to the PR fallback. Parse the
+          # push stderr to tell the two shapes apart.
+          mode=""
+          for attempt in 1 2 3; do
+            if ! git pull --rebase origin main; then
+              git rebase --abort 2>/dev/null || true
+              echo "git pull --rebase failed (attempt $attempt of 3)." >&2
+              [ "$attempt" -lt 3 ] && { sleep 5; continue; }
+              break
+            fi
+            if push_out="$(git push origin HEAD:main 2>&1)"; then
+              printf '%s\n' "$push_out"
+              mode=direct
+              break
+            fi
+            printf '%s\n' "$push_out" >&2
+            if printf '%s' "$push_out" \
+                | grep -Eqi 'GH013|repository rule violations|protected branch'; then
+              echo 'Protected-branch rejection (GH013) — deterministic under the' >&2
+              echo 'main ruleset, retrying is futile. Falling back to a PR.' >&2
+              break
+            fi
+            echo "Push attempt $attempt of 3 failed for a non-ruleset reason" >&2
+            echo '(likely a concurrent-push race); retrying after a rebase.' >&2
+            [ "$attempt" -lt 3 ] && sleep 5
+          done
+          if [ "$mode" = "direct" ]; then
             echo "committed=true" >> "$GITHUB_OUTPUT"
             echo "mode=direct" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git rebase --abort 2>/dev/null || true
-          echo 'Direct push to main rejected (expected under the main ruleset:' >&2
-          echo 'pull_request is required — GH013). Falling back to a PR.' >&2
           branch="signed-manifest/${GITHUB_RUN_ID}"
-          git push origin "HEAD:refs/heads/$branch"
+          # If even the branch push fails (a ruleset targeting
+          # signed-manifest/*, token permissions, outage), do not die
+          # bare: the signed bytes would be stranded in the ephemeral
+          # runner. Preserve the signing commit as a patch in the step
+          # summary so an operator can `git am` it locally.
+          if ! git push origin "HEAD:refs/heads/$branch"; then
+            {
+              echo '## Signing-branch push failed — commit preserved as a patch'
+              echo
+              echo "Pushing \`$branch\` was rejected. Check for a ruleset that"
+              echo 'also targets `signed-manifest/*` branches, for the'
+              echo "workflow token's contents:write permission, or a transient"
+              echo 'GitHub outage. The signing commit is recoverable: save the'
+              echo 'patch below, apply it locally with `git am`, push a branch,'
+              echo 'and open a PR to main.'
+              echo
+              echo '```'
+              git format-patch -1 --stdout
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "FAIL: could not push $branch. If a ruleset also targets" >&2
+            echo 'signed-manifest/* branches, exempt this workflow or those' >&2
+            echo 'refs. The signing commit is preserved as a git format-patch' >&2
+            echo 'in the step summary — recover it with `git am`.' >&2
+            exit 1
+          fi
+          # Newest signing wins: an open PR from an earlier signing run
+          # carries stale bytes, and merging it after this run would
+          # publish an older manifest. Close it and delete its branch,
+          # loudly, before opening the fresh PR.
+          stale="$(gh pr list --state open --json number,url,headRefName \
+            --jq '.[] | select(.headRefName | startswith("signed-manifest/"))
+                  | [(.number | tostring), .url, .headRefName] | @tsv')"
+          if [ -n "$stale" ]; then
+            printf '%s\n' "$stale" | while IFS=$'\t' read -r num url head; do
+              [ "$head" = "$branch" ] && continue
+              echo "Closing stale signing PR #$num ($url) and deleting branch $head — newest signing wins."
+              gh pr close "$num" --delete-branch \
+                --comment "Superseded by a newer signing run (run ${GITHUB_RUN_ID} opens a fresh signing PR — newest signing wins). Closing this PR and deleting \`$head\`." \
+                || echo "::warning::Could not close stale signing PR #$num ($url). Close it manually — merging it now would publish stale bytes."
+            done
+          fi
           valid_until="$(jq -r '.validUntil // "<missing>"' "$MANIFEST_OUT")"
           {
             echo 'Signed in CI by the sign-manifest workflow. The main ruleset'
             echo 'rejected the direct push (GH013: pull_request required), so the'
             echo 'signing commit arrives via this PR instead. Merging it is the'
-            echo 'human step that lands the signed bytes on main.'
+            echo 'human step that lands the signed bytes on main — squash merge'
+            echo '(the ruleset requires linear history and allows squash only).'
             echo
             echo "- **Signer**: \`onymchat/onym-discovery@$PINNED_SIGNER_REV\` (built from source at the pinned rev)"
             echo "- **Operator id**: \`${OPERATOR:-<not derived>}\`"
             echo "- **Operator fingerprint**: \`${FINGERPRINT:-<not derived>}\`"
             echo "- **validUntil**: \`$valid_until\`"
             echo
-            echo 'CI verifies the manifest/signature pair with the boot-path'
-            echo 'verifier (verify-operator-manifest): warn-mode on this PR,'
-            echo 'hard-fail on main once merged. Deploy and'
-            echo 'served-byte verification happen after merge — see the signing'
-            echo "run's job summary for the exact steps."
+            if [ "$PR_TOKEN_MODE" = "signing-pr-token" ]; then
+              echo 'Created with the `SIGNING_PR_TOKEN` secret, so CI runs on'
+              echo 'this PR: `verify-operator-manifest` (the boot-path verifier)'
+              echo 'checks the manifest/signature pair — warn-mode here,'
+              echo 'hard-fail on main once merged.'
+            else
+              echo '**This PR carries no CI runs** (GITHUB_TOKEN recursion'
+              echo "guard: PRs created with the workflow's own token never"
+              echo 'trigger workflows). Verification happens in the post-merge'
+              echo 'push run on main, where `verify-operator-manifest` (the'
+              echo 'boot-path verifier) hard-fails on a bad pair.'
+            fi
+            echo
+            echo 'After merging, per deploy path:'
+            echo '- **App Platform** (default): re-dispatch sign-manifest'
+            echo '  WITHOUT `skip_deploy` — signing is idempotent on unchanged'
+            echo '  src (nothing to commit), so the deploy and the strict'
+            echo '  served-byte verification run.'
+            echo '- **onym-infra droplet**: bump the relayer submodule, set'
+            echo '  `RELAYER_OPERATOR_MANIFEST` in relayer.env, deploy'
+            echo '  onym-infra, then re-dispatch WITH `skip_deploy=true` for'
+            echo '  the served-byte check.'
           } > "$RUNNER_TEMP/pr-body.md"
-          pr_url="$(gh pr create --base main --head "$branch" \
+          if ! pr_url="$(gh pr create --base main --head "$branch" \
             --title "Publish signed operator manifest ($(date -u +%Y-%m-%d))" \
-            --body-file "$RUNNER_TEMP/pr-body.md")"
+            --body-file "$RUNNER_TEMP/pr-body.md" 2>"$RUNNER_TEMP/pr-create.err")"; then
+            cat "$RUNNER_TEMP/pr-create.err" >&2
+            if grep -Eqi 'not permitted|HTTP 403|Resource not accessible' "$RUNNER_TEMP/pr-create.err"; then
+              echo 'gh pr create was refused (403). With the default GITHUB_TOKEN' >&2
+              echo 'this requires the setting "Allow GitHub Actions to create and' >&2
+              echo 'approve pull requests" to be enabled under Settings -> Actions' >&2
+              echo '-> General — at BOTH the org and the repo level (the org' >&2
+              echo 'setting caps the repo one). Enable it, or set the' >&2
+              echo 'SIGNING_PR_TOKEN secret (PAT/App token) instead.' >&2
+            fi
+            echo "The signing commit is safe on branch $branch — open the PR" >&2
+            echo 'manually from that branch after fixing the cause above.' >&2
+            exit 1
+          fi
           # Label only when the repo already has a matching label —
           # minting labels is not this workflow's business, and a
           # missing label must not fail the run post-signing.
           for lbl in signed-manifest automated; do
-            if gh label list --json name --jq '.[].name' | grep -Fxq "$lbl"; then
+            if gh label list --limit 100 --json name --jq '.[].name' | grep -Fxq "$lbl"; then
               gh pr edit "$pr_url" --add-label "$lbl" || true
             fi
           done
           echo "committed=false" >> "$GITHUB_OUTPUT"
           echo "mode=pr" >> "$GITHUB_OUTPUT"
           echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
-          echo "Opened $pr_url — merge it to land the signed bytes on main."
+          echo "token_mode=$PR_TOKEN_MODE" >> "$GITHUB_OUTPUT"
+          echo "Opened $pr_url — squash-merge it to land the signed bytes on main."
 
       # PR-fallback mode: the signed bytes are NOT on main yet, so
       # deploying or byte-checking now would deploy/verify a stale
@@ -343,17 +456,24 @@ jobs:
         if: ${{ steps.commit.outputs.mode == 'pr' }}
         env:
           PR_URL: ${{ steps.commit.outputs.pr_url }}
+          TOKEN_MODE: ${{ steps.commit.outputs.token_mode }}
         run: |
           echo "::notice::Signed bytes await PR merge: $PR_URL — deploy and byte verification are skipped in this run."
+          if [ "$TOKEN_MODE" != "signing-pr-token" ]; then
+            echo "::notice::That PR carries no CI runs (GITHUB_TOKEN recursion guard); verification happens in the post-merge push run on main."
+          fi
           echo 'The bytes are not on main yet, so this run stops before the'
-          echo 'deploy/byte-verification steps. After the PR merges, main carries'
-          echo 'the signed bytes: the onym-infra deploy path picks them up from'
-          echo 'main (bump the relayer submodule, set RELAYER_OPERATOR_MANIFEST'
-          echo 'in relayer.env, deploy), and verification is covered by CI'\''s'
-          echo 'verify-operator-manifest check plus the infra deploy. To byte-check'
-          echo 'the served endpoint afterwards, dispatch this workflow again with'
-          echo 'skip_deploy=true — signing is idempotent on unchanged src, so it'
-          echo 'finds nothing to commit and just checks the served bytes.'
+          echo 'deploy/byte-verification steps. Squash-merge the PR (the main'
+          echo 'ruleset requires linear history and allows squash only); main'
+          echo 'then carries the signed bytes. Then, per deploy path:'
+          echo '  * App Platform (default): re-dispatch this workflow WITHOUT'
+          echo '    skip_deploy — signing is idempotent on unchanged src, so it'
+          echo '    finds nothing to commit (mode=none) and the deploy plus the'
+          echo '    strict served-byte verification run.'
+          echo '  * onym-infra droplet: bump the relayer submodule, set'
+          echo '    RELAYER_OPERATOR_MANIFEST in relayer.env, deploy onym-infra,'
+          echo '    then re-dispatch WITH skip_deploy=true for the served-byte'
+          echo '    check (nothing to commit; the check is the point).'
 
       # Checked in its own step BEFORE digitalocean/action-doctl: with
       # an empty token that action dies with an opaque auth error, and
@@ -575,6 +695,7 @@ jobs:
           FINGERPRINT: ${{ steps.identity.outputs.fingerprint }}
           COMMITTED: ${{ steps.commit.outputs.committed }}
           PR_URL: ${{ steps.commit.outputs.pr_url }}
+          TOKEN_MODE: ${{ steps.commit.outputs.token_mode }}
         run: |
           digest=""
           if [ -f "$MANIFEST_OUT" ]; then
@@ -595,8 +716,12 @@ jobs:
               echo "- **Signing PR (awaiting merge)**: $PR_URL"
               echo
               echo 'The main ruleset rejected the direct push, so the signed bytes'
-              echo 'travel via the PR above. Merge it to land them on main; deploy'
-              echo 'and served-byte verification were skipped in this run.'
+              echo 'travel via the PR above. Squash-merge it to land them on main;'
+              echo 'deploy and served-byte verification were skipped in this run.'
+              if [ "$TOKEN_MODE" != "signing-pr-token" ]; then
+                echo 'The PR carries no CI runs (GITHUB_TOKEN recursion guard);'
+                echo 'verification happens in the post-merge push run on main.'
+              fi
             fi
             echo
             echo 'The Discovery catalog pins this operator id: replace'
